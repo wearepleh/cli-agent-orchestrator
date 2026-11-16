@@ -57,7 +57,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     WorkflowRunResult,
 )
 from cli_agent_orchestrator.providers.base import OutputExtractionError
-from cli_agent_orchestrator.services import workflow_journal
+from cli_agent_orchestrator.services import step_params, workflow_journal
 from cli_agent_orchestrator.services.agent_step import (
     StepCancelledError,
     StepExecutionError,
@@ -68,6 +68,7 @@ from cli_agent_orchestrator.services.step_output_store import (
     _validate_key_part,
     step_output_store,
 )
+from cli_agent_orchestrator.services.step_result import build_envelope, serialise_envelope
 
 # RE-EXPORT, not a use (issue #583, unit ``workflow-errors``, BR-2/INV-5). ADR-583-9 MOVED
 # these two exceptions to the ``workflow_errors`` leaf so ``workflow_journal`` can import them
@@ -91,6 +92,8 @@ from cli_agent_orchestrator.services.workflow_errors import (
 from cli_agent_orchestrator.services.workflow_errors import (
     ReplayDivergenceError as ReplayDivergenceError,
 )
+from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+from cli_agent_orchestrator.utils.sqlite_connection import closing_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +164,11 @@ class StepRunState:
     output: Optional[StepOutputRecord] = None
     terminal_id: Optional[str] = None
     error: Optional[str] = None
+    # Structured failure kind, mirrored from ``StepExecutionError.kind`` on a
+    # failed attempt and cleared when the step later settles (issue #638). Carried
+    # in memory so ``_build_result`` can surface it on the run's result envelope;
+    # the DURABLE copy is the ``workflow_run_step.error_kind`` column.
+    error_kind: Optional[str] = None
     # In-memory carrier for the step's ``v2`` call fingerprint (issue #583, unit
     # ``settlement-rewire``, BR-2/TD-3). ``run_agent_step`` COMPUTES the value in the one
     # window BR-5 permits — after working-directory resolution, before terminal creation —
@@ -176,6 +184,11 @@ class StepRunState:
     call_fingerprint: Optional[str] = None
     which_guard_fired: Optional[str] = None  # RESERVED (N8) — always None in MVP
     iterations_run: Optional[int] = None  # RESERVED (N8) — always None in MVP
+    # The text the step's final terminal answered with (``AgentStepResult.last_message``),
+    # carried from ``run_agent_step`` (or the reprompt) to the settle that stores it as the
+    # step's result envelope for the run view. IN-MEMORY ONLY, like ``call_fingerprint``:
+    # the durable copy is ``workflow_run_step.result_json``, redacted and bounded.
+    last_message: Optional[str] = None
 
 
 @dataclass
@@ -205,6 +218,17 @@ class RunRecord:
     # constructed here; it binds to the running loop lazily on first await, so
     # building a RunRecord outside a loop (unit tests) is safe.
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # The terminal that started this run, when an agent did
+    # (``WorkflowRunRequest.caller_id``, sent by the MCP workflow tools and by
+    # ``cao workflow`` from inside a terminal). Every step's worker is created
+    # with ``delegating_terminal_id=caller_id`` so its tools are bounded by that
+    # terminal's RECORDED delegation ceiling (utils/delegation.py). Persisted on
+    # the journal row (``workflow_run.caller_id``) at start, so a resume or a
+    # recovery after a restart re-binds to the ORIGINAL starter through
+    # ``bound_caller`` and never widens; only a run started with no caller
+    # takes the resumer's bound. None for operator-started runs (CLI, curl),
+    # which are unbounded.
+    caller_id: Optional[str] = None
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -278,6 +302,17 @@ def _record_from_json(output_json: Optional[str]) -> Optional[StepOutputRecord]:
     )
 
 
+def bound_caller(original: Optional[str], resumer: Optional[str]) -> Optional[str]:
+    """The terminal whose ceiling bounds a resumed run: the original starter if known.
+
+    Journaled ``caller_id`` (the agent that started the run) wins over whoever
+    resumes it, so an operator or a wider agent resuming a reviewer's run does
+    not widen its steps. A run started with no caller is bounded by the resumer,
+    which can only narrow it.
+    """
+    return original if original else resumer
+
+
 def _journal_insert_run(record: RunRecord) -> None:
     """Best-effort INSERT of the run + its seeded steps at ``start_run`` (§1)."""
     try:
@@ -288,6 +323,9 @@ def _journal_insert_run(record: RunRecord) -> None:
             inputs_json=json.dumps(record.inputs),
             state=record.state.value,
             started_at=record.started_at,
+            # Only when an agent started the run, so operator runs write the
+            # same call as before.
+            **({"caller_id": record.caller_id} if record.caller_id else {}),
         )
         workflow_journal.insert_steps(
             record.run_id,
@@ -327,6 +365,68 @@ def _journal_step(record: RunRecord, step_id: str, error_kind: Optional[str] = N
         Exception
     ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
         logger.debug("journal: update_step '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_step_terminal(record: RunRecord, step_id: str, terminal_id: Optional[str]) -> None:
+    """Best-effort UPDATE of the step row's ``terminal_id`` alone (the run view).
+
+    Its own write because ``update_step`` rewrites every column it lists, and the run
+    view needs the id while the step is still running, long before the step settles.
+    """
+    try:
+        workflow_journal.set_step_terminal(record.run_id, step_id, terminal_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 (journal write is best-effort; the step must not fail on it)
+        logger.debug("journal: set_step_terminal '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_step_result(
+    record: RunRecord, step_id: str, status: str, last_message: Optional[str]
+) -> None:
+    """Best-effort write of a settled step's final answer to ``result_json`` (the run view).
+
+    The envelope is the one the script tier stores in ``record_step_completion``:
+    ``build_envelope`` redacts secrets first and then caps the text at
+    ``WORKFLOW_JOURNAL_RESULT_MAX_BYTES``, setting ``redacted`` and ``truncated``. A step
+    that settled without an answer (failed, or cancelled in flight) gets an envelope with
+    empty text, as the script tier stores on its failure arms, so an ABSENT envelope keeps
+    meaning "not settled yet, or settled before this column was filled".
+
+    YAML rows carry no call fingerprint, so this envelope can never make a row replayable:
+    ``step_replay.decide`` halts on an absent fingerprint before it reads an envelope as a
+    result, and the run-step route consults it for script-tier runs only.
+    """
+    st = record.step_states[step_id]
+    try:
+        workflow_journal.set_step_result(
+            record.run_id,
+            step_id,
+            serialise_envelope(build_envelope(last_message or "", status, st.terminal_id)),
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 (journal write is best-effort; the step must not fail on it)
+        logger.debug("journal: set_step_result '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_clear_step_view(record: RunRecord, step_ids: List[str]) -> None:
+    """Best-effort clear of the run-view columns of steps a resume will run again.
+
+    Clears ``result_json`` so a re-run step never shows the previous attempt's answer,
+    and ``terminal_id`` so it never points at the previous attempt's terminal before its
+    new one starts (the in-memory reset already drops it, B4-BR-10).
+    """
+    for step_id in step_ids:
+        try:
+            workflow_journal.set_step_result(record.run_id, step_id, None)
+            workflow_journal.set_step_terminal(record.run_id, step_id, None)
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 (journal write is best-effort; resume must not fail on it)
+            logger.debug(
+                "journal: clearing the run view of '%s/%s' failed: %s", record.run_id, step_id, e
+            )
 
 
 def _journal_current_step(record: RunRecord) -> None:
@@ -520,10 +620,41 @@ def _substitute(template: str, record: RunRecord) -> str:
     return _PLACEHOLDER_RE.sub(_resolve, template)
 
 
-def _reprompt_prompt(step: WorkflowStep) -> str:
+def _build_step_prompt(
+    step: WorkflowStep, record: RunRecord, template: Optional[str] = None
+) -> str:
+    """Return the prompt the engine sends for ``step``: the ONE place it is built.
+
+    Every path that sends a step prompt goes through here: the normal run and its
+    retries (``_run_step``), the reprompt (which extends the prompt ``_run_step``
+    built), and ``replay_single_step``. ``template`` replaces ``step.prompt`` for a
+    replay's ``prompt_override``; the step's params still apply.
+
+    The prompt is ``_substitute(template)``, then, only when ``step.params`` is
+    non-empty, a blank line and a parameters block in declaration order::
+
+        <substituted prompt>
+
+        Parameters for this step:
+        - <key>: <value>
+
+    Param values are literal text: they get no ``{{...}}`` substitution, so a value
+    can never pull in an input or another step's output. With no params the prompt
+    is byte-identical to the one the engine sent before params existed.
+
+    Raises ``WorkflowEngineError`` from ``_substitute`` for an unresolvable reference.
+    """
+    prompt = _substitute(step.prompt if template is None else template, record)
+    if not step.params:
+        return prompt
+    lines = "\n".join(f"- {key}: {value}" for key, value in step.params.items())
+    return f"{prompt}\n\nParameters for this step:\n{lines}"
+
+
+def _reprompt_prompt(step: WorkflowStep, prompt: str) -> str:
     """A corrective prompt restating the schema and asking for a valid return (§3)."""
     return (
-        f"{step.prompt}\n\n"
+        f"{prompt}\n\n"
         "Your previous turn did not produce a valid structured output for this "
         "workflow step. Call the `workflow_return` tool with output that matches "
         f"this JSON-Schema:\n{step.output_schema}"
@@ -639,8 +770,134 @@ def _topological_order(spec: WorkflowSpec) -> List[WorkflowStep]:
     return [by_id[sid] for sid in order]
 
 
-async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> StepState:
+# ---------------------------------------------------------------------------
+# Recording a step's terminal as soon as it exists (the run view)
+# ---------------------------------------------------------------------------
+# Strong references to terminal recordings still in flight (see ``_TerminalRecorder``).
+_pending_recordings: Set["asyncio.Task[None]"] = set()
+
+
+async def _record_step_terminal(
+    record: RunRecord,
+    step: WorkflowStep,
+    attempt: int,
+    terminal_id: str,
+    *,
+    emit_event: bool,
+) -> None:
+    """Save the step's terminal on its row, then emit ``terminal.created``.
+
+    Row first, so a reader that sees the event and asks for the step's screen finds the
+    terminal already recorded. Both writes are best-effort and never raise.
+    """
+    await _ajournal(_journal_step_terminal, record, step.id, terminal_id)
+    if emit_event:
+        await _journal_event(
+            record,
+            "terminal.created",
+            step_id=step.id,
+            attempt=attempt,
+            terminal_id=terminal_id,
+            provider=step.provider,
+            agent_profile=step.agent,
+        )
+
+
+class _TerminalRecorder:
+    """The ``on_step_terminal_ready`` hook for ONE ``run_agent_step`` call of a YAML step.
+
+    WHERE IT RUNS. ``run_agent_step`` calls the hook through ``_notify_terminal_ready``, a
+    plain synchronous call inside that coroutine, right after
+    ``await terminal_service.create_terminal(...)`` and before the readiness wait. So the
+    hook runs ON THE EVENT LOOP, between two awaits, and must not block: it sets the
+    in-memory terminal id and schedules the durable work (row, then event) as a task on
+    the same loop. ``test_workflow_run_view_engine.py`` pins that the hook runs on the loop
+    thread; if it ever moves to a worker thread, this must switch to
+    ``loop.call_soon_threadsafe``.
+
+    ORDER. The caller awaits :meth:`settle` (or :meth:`settle_failed`) as soon as
+    ``run_agent_step`` returns or raises, before the engine emits anything else for the
+    attempt, so ``terminal.created`` always lands between ``step.attempt.started`` and
+    the attempt's outcome event.
+
+    BEST-EFFORT. ``_notify_terminal_ready`` logs and swallows a hook failure, and the
+    durable writes swallow their own. When the hook never scheduled its task (it raised,
+    or a test replaced ``run_agent_step`` with a fake that ignores the hook), :meth:`settle`
+    records the terminal then, from the id the call returned or raised with. An attempt
+    that opened a terminal therefore records it exactly once either way.
+
+    WHY THE CALLERS CALL ``run_agent_step`` THEMSELVES rather than through a wrapper:
+    ``test_launch_path_invariant.py`` checks every ``run_agent_step`` call site passes its
+    delegation ceiling (``delegating_terminal_id``) as an explicit keyword, so the call
+    stays visible in ``_run_step`` and ``_collect_structured_output``.
+    """
+
+    def __init__(
+        self, record: RunRecord, step: WorkflowStep, attempt: int, *, emit_event: bool
+    ) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._record = record
+        self._step = step
+        self._attempt = attempt
+        self._emit_event = emit_event
+        self._task: Optional["asyncio.Task[None]"] = None
+
+    def __call__(self, terminal_id: str, _call_fingerprint: str) -> None:
+        # The call fingerprint is the script tier's replay identity. A YAML row never
+        # carries one, which keeps YAML rows off the replay gate's verified path.
+        self._record.step_states[self._step.id].terminal_id = terminal_id
+        task = self._loop.create_task(
+            _record_step_terminal(
+                self._record,
+                self._step,
+                self._attempt,
+                terminal_id,
+                emit_event=self._emit_event,
+            )
+        )
+        # The loop keeps only a weak reference to a task. Hold a strong one until it is
+        # done, so a recording outlives a drive that is cancelled before it settles.
+        _pending_recordings.add(task)
+        task.add_done_callback(_pending_recordings.discard)
+        self._task = task
+
+    async def settle(self, terminal_id: Optional[str]) -> None:
+        """Wait for the hook's recording, or record now if the hook never scheduled one."""
+        task = self._task
+        if task is not None:
+            # ``asyncio.wait`` never raises the task's own error, and never cancels it.
+            await asyncio.wait({task})
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "run '%s' step '%s': recording terminal %s failed: %s",
+                    self._record.run_id,
+                    self._step.id,
+                    terminal_id,
+                    task.exception(),
+                )
+            return
+        if terminal_id is None:
+            return  # no terminal was opened (the launch itself was refused or failed)
+        self._record.step_states[self._step.id].terminal_id = terminal_id
+        await _record_step_terminal(
+            self._record, self._step, self._attempt, terminal_id, emit_event=self._emit_event
+        )
+
+    async def settle_failed(self, exc: BaseException) -> None:
+        """:meth:`settle` for a call that raised, with the terminal the error names."""
+        raised = getattr(exc, "terminal_id", None)
+        await self.settle(raised if isinstance(raised, str) else None)
+
+
+async def _collect_structured_output(
+    record: RunRecord, step: WorkflowStep, prompt: str
+) -> StepState:
     """Collect the structured return for a COMPLETED step; reprompt once (§3).
+
+    ``prompt`` is the attempt's prompt exactly as ``_build_step_prompt`` built it
+    (substituted, params block included). The reprompt extends that text rather
+    than rebuilding it, so the corrective turn repeats the same instructions and
+    the same parameters.
 
     - No ``output_schema`` -> free-form, trivially ``COMPLETED``.
     - Validated record present -> ``COMPLETED`` (output copied onto the step state).
@@ -675,21 +932,33 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
         )
         # Re-run on a FRESH terminal with a corrective prompt. A crash here is a
         # run-failure: let the StepExecutionError propagate so the OUTER loop
-        # consumes an attempt (Q6=A / Trace C).
-        result = await run_agent_step(
-            provider=step.provider,
-            agent=step.agent,
-            prompt=_reprompt_prompt(step),
-            teardown=True,
-            timeout=WORKFLOW_STEP_TIMEOUT,
-            engine=step.engine,
-            env_vars={
-                "CAO_WORKFLOW_RUN_ID": record.run_id,
-                "CAO_WORKFLOW_STEP_ID": step.id,
-            },
-            cancel_event=record.cancel_event,
-        )
+        # consumes an attempt (Q6=A / Trace C). The reprompt's terminal is saved on
+        # the step row as soon as it exists, and it gets its own ``terminal.created``
+        # with the same attempt number: it is a second terminal in the same attempt,
+        # and a run view following the first one must learn that it moved.
+        recorder = _TerminalRecorder(record, step, st.attempts, emit_event=True)
+        try:
+            result = await run_agent_step(
+                provider=step.provider,
+                agent=step.agent,
+                prompt=_reprompt_prompt(step, prompt),
+                teardown=True,
+                timeout=WORKFLOW_STEP_TIMEOUT,
+                engine=step.engine,
+                env_vars={
+                    "CAO_WORKFLOW_RUN_ID": record.run_id,
+                    "CAO_WORKFLOW_STEP_ID": step.id,
+                },
+                on_step_terminal_ready=recorder,
+                cancel_event=record.cancel_event,
+                delegating_terminal_id=record.caller_id,
+            )
+        except Exception as exc:
+            await recorder.settle_failed(exc)
+            raise
+        await recorder.settle(result.terminal_id)
         st.terminal_id = result.terminal_id
+        st.last_message = result.last_message
         rec = step_output_store.get(record.run_id, step.id)
         if rec is not None and rec.validated:
             st.output = rec
@@ -750,36 +1019,45 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             provider=step.provider,
             agent_profile=step.agent,
         )
-        prompt = _substitute(step.prompt, record)  # §4 templating
+        prompt = _build_step_prompt(step, record)  # §4 templating, then the params block
+        # An attempt starts with no answer, so a failed attempt never leaves one behind.
+        st.last_message = None
         try:
-            result = await run_agent_step(
-                provider=step.provider,
-                agent=step.agent,
-                prompt=prompt,
-                teardown=True,
-                timeout=WORKFLOW_STEP_TIMEOUT,
-                engine=step.engine,
-                env_vars={
-                    "CAO_WORKFLOW_RUN_ID": record.run_id,
-                    "CAO_WORKFLOW_STEP_ID": step.id,
-                },
-                cancel_event=record.cancel_event,
-            )
+            # ``terminal.created`` is emitted from inside this call, as soon as the
+            # step's terminal exists (before the readiness wait), together with the
+            # terminal id on the step row, so the run view can watch the step while it
+            # runs. The recorder is settled before anything else is emitted for the
+            # attempt, which keeps the per-attempt order: attempt.started,
+            # terminal.created, then the outcome.
+            recorder = _TerminalRecorder(record, step, attempt, emit_event=True)
+            try:
+                result = await run_agent_step(
+                    provider=step.provider,
+                    agent=step.agent,
+                    prompt=prompt,
+                    teardown=True,
+                    timeout=WORKFLOW_STEP_TIMEOUT,
+                    engine=step.engine,
+                    env_vars={
+                        "CAO_WORKFLOW_RUN_ID": record.run_id,
+                        "CAO_WORKFLOW_STEP_ID": step.id,
+                    },
+                    on_step_terminal_ready=recorder,
+                    cancel_event=record.cancel_event,
+                    # The agent that started the run bounds every step it dispatches
+                    # (utils/delegation.py); None for an operator-started run.
+                    delegating_terminal_id=record.caller_id,
+                )
+            except Exception as exc:
+                await recorder.settle_failed(exc)
+                raise
+            await recorder.settle(result.terminal_id)
             st.terminal_id = result.terminal_id
-            # U2 emission: a terminal exists for this step (after the id is bound).
-            await _journal_event(
-                record,
-                "terminal.created",
-                step_id=step.id,
-                attempt=attempt,
-                terminal_id=result.terminal_id,
-                provider=step.provider,
-                agent_profile=step.agent,
-            )
+            st.last_message = result.last_message
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
-            outcome = await _collect_structured_output(record, step)
+            outcome = await _collect_structured_output(record, step, prompt)
         except StepCancelledError as exc:
             # An in-flight cancel (#409b) is NOT a run-failure: do NOT consume the
             # rest of the retry budget and do NOT mark the step FAILED. Settle the
@@ -791,7 +1069,13 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
             st.state = StepState.SKIPPED
+            # A cancelled step settled SKIPPED, not failed — never report a kind
+            # carried over from an earlier failed attempt of the same step.
+            st.error_kind = None
             await _ajournal(_journal_step, record, step.id)
+            # The run view's answer: an envelope with no text, as the script tier
+            # stores when a step settled without one (never an absent envelope).
+            await _ajournal(_journal_step_result, record, step.id, st.state.value, None)
             # U2 emission (BR-7): a cancellation settles the step SKIPPED — NEVER a
             # failure event. The run converges CANCELLED at the drive-loop finalize.
             await _journal_event(
@@ -809,9 +1093,32 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 step.id,
             )
             return
+        except DelegationCeilingError as exc:
+            # The step's worker would hold tools the run's caller may not delegate
+            # (utils/delegation.py). Raised by create_terminal BEFORE any terminal
+            # exists, deterministic for the run, so it consumes the whole budget:
+            # retrying would refuse again. Settle the step FAILED with the refusal
+            # text (kind ``error``), journal it, and let the drive loop finish the
+            # run as any other step failure, rather than escaping the engine.
+            st.error = str(exc)
+            last_error_kind = "error"
+            await _ajournal(_journal_step, record, step.id, last_error_kind)
+            await _journal_event(
+                record,
+                "step.attempt.failed",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                error_kind=last_error_kind,
+                terminal_id=None,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
+            break  # no retry: the refusal does not change between attempts
         except StepExecutionError as exc:
             st.error = str(exc)
             last_error_kind = exc.kind
+            st.error_kind = exc.kind
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
             # BR-6: persist the structured error kind onto the step projection now
@@ -834,8 +1141,21 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             continue  # consume an attempt, retry the same prompt
         # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
         st.state = outcome
+        # A retried step that finally settled is not failed any more; clear the
+        # carried kind so the result envelope cannot report a stale failure.
+        st.error_kind = None
         # §1: persist settled state + output + attempts (error_kind cleared to NULL).
         await _ajournal(_journal_step, record, step.id)
+        # The run view's answer, written before the outcome events so a reader that
+        # reacts to ``step.completed`` finds it. The status is the terminal status the
+        # step finished with, as the script tier's success arm records.
+        await _ajournal(
+            _journal_step_result,
+            record,
+            step.id,
+            getattr(result.status, "value", str(result.status)),
+            st.last_message,
+        )
         # U2 emission: a validated/collected output was received (validation_result
         # distinguishes valid from invalid); then the step settled.
         if st.output is not None:
@@ -882,6 +1202,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
     # §1: persist FAILED state + last error + attempts + the structured error kind
     # (BR-6, so a cold read surfaces the kind with no event replay).
     await _ajournal(_journal_step, record, step.id, last_error_kind)
+    # The run view's answer: empty text with status ``failed``, matching what the script
+    # tier stores for a failed step (its failure arms carry no ``last_message``).
+    await _ajournal(_journal_step_result, record, step.id, st.state.value, None)
     # U2 emission: the step is terminally FAILED (carries the last error kind).
     await _journal_event(
         record,
@@ -935,6 +1258,7 @@ def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRe
                 attempts=st.attempts,
                 output=st.output.output if st.output is not None else None,
                 error=st.error,
+                error_kind=st.error_kind,
             )
         )
     return WorkflowRunResult(
@@ -1083,8 +1407,17 @@ def _check_run_id_available(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 # §1 — start_run entry point
 # ---------------------------------------------------------------------------
-async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
+async def start_run(
+    spec: WorkflowSpec,
+    inputs: Dict[str, Any],
+    run_id: str,
+    caller_id: Optional[str] = None,
+) -> WorkflowRunResult:
     """Run a validated workflow spec to completion, awaited inline (§1, Q1=A).
+
+    ``caller_id`` is the terminal starting the run, if an agent did; it is
+    recorded on the ``RunRecord`` so every step is bounded by that terminal's
+    delegation ceiling (see ``RunRecord.caller_id``).
 
     Steps: validate the run_id key (B3-BR-1, shared validator) and the inputs
     against ``spec.inputs`` (B3-BR-2) — failing BEFORE any terminal is created;
@@ -1094,7 +1427,9 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     Raises ``ValueError`` (-> 400) on a bad run_id / invalid inputs, ``KeyError``
     (-> 409) if the run_id is already registered, actively driving, or journaled
     (a durable row must never be clobbered by a reused id), ``NotBuiltYetError``
-    (-> reserved seam) for a non-sequential mode, ``WorkflowEngineError`` (-> 500)
+    (-> reserved seam) for a non-sequential mode or a reserved step ``call``,
+    ``StepParamError`` (-> 422) when a step's params do not fit the params its
+    profile declares, ``WorkflowEngineError`` (-> 500)
     on an engine-internal invariant violation (e.g. a bad template reference).
     """
     # 1. Validate run_id via the shared key validator (B3-BR-1), then the
@@ -1111,6 +1446,12 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     # sequential (B3-BR-6/B3-BR-10).
     if spec.mode != "sequential":
         _dispatch_reserved_mode(spec)
+    # Likewise a reserved step call type: refused before the RunRecord exists, so
+    # no journal row is written, rather than run as a handoff.
+    _refuse_reserved_calls(spec)
+    # Step params against the params each step's profile declares: refused here too,
+    # before any journal row. Off the loop, since it reads profile files.
+    await asyncio.to_thread(step_params.refuse_step_param_errors, spec)
 
     # 3. Build the RunRecord.
     record = RunRecord(
@@ -1123,6 +1464,7 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         cancelled=False,
         step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
         started_at=_now(),
+        caller_id=caller_id,
     )
     # 4. Register (in-memory floor) + mark the drive live + journal the run +
     # seed every step (§1). The ``finally`` guarantees the liveness mark is
@@ -1274,8 +1616,9 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
     can never leave a step absent from the rebuilt record (F8 / B4-RD-3) — the
     engine drive's ``record.step_states[step.id]`` stays total.
 
-    ``reprompted``/``terminal_id`` are NOT journaled (F3): on a kept step they are
-    irrelevant (it is skipped), on a reset step they are cleared anyway (B4-BR-9),
+    ``reprompted`` is NOT journaled (F3), and ``terminal_id`` is journaled only for the
+    run view (``set_step_terminal``), so neither is read back here: on a kept step they
+    are irrelevant (it is skipped), on a reset step they are cleared anyway (B4-BR-9),
     so they default here.
     """
     try:
@@ -1304,6 +1647,7 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
             current_step_id=row.current_step_id,
             started_at=row.started_at,
             finished_at=row.finished_at,
+            caller_id=row.caller_id,
         )
     except (ValidationError, ValueError, TypeError) as e:
         # ValidationError subclasses ValueError (pydantic v2) but is named for clarity;
@@ -1436,7 +1780,7 @@ def update_run_generation(run_id: str, generation: str) -> None:
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+    with closing_transaction(sqlite3.connect(str(DATABASE_FILE))) as conn:
         conn.execute(
             "UPDATE workflow_run SET generation = ? WHERE run_id = ?",
             (generation, run_id),
@@ -1492,8 +1836,34 @@ def _dispatch_reserved_mode(spec: WorkflowSpec) -> None:
     raise NotBuiltYetError(f"workflow mode '{spec.mode}' is reserved (not built yet)")
 
 
-async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
+def _refuse_reserved_calls(spec: WorkflowSpec) -> None:
+    """Refuse a spec with a step whose ``call`` the engine does not run (B3-BR-10).
+
+    The engine runs every step as a handoff. ``assign`` and ``send_message``
+    validate as reserved constructs; running one is refused here, on every run path
+    and before any journal row is written, rather than silently run as a handoff.
+    The check is on the call value itself, not on ``is_reserved``: shipping a call
+    type means building its execution here first, not only flipping a unit flag.
+
+    Raises ``NotBuiltYetError`` (-> 501) naming the first such step.
+    """
+    for step in spec.steps:
+        if step.call is not None and step.call != "handoff":
+            raise NotBuiltYetError(
+                f"step '{step.id}' uses call '{step.call}', which is reserved (not built yet)"
+            )
+
+
+async def resume_from_last_completed(
+    run_id: str, caller_id: Optional[str] = None
+) -> WorkflowRunResult:
     """Resume a crashed/failed run from its durable journal (§3, FR-6.2, N6).
+
+    ``caller_id`` is the terminal resuming the run, if an agent is. The re-run
+    steps are bounded by the ORIGINAL starter's ceiling when the journal row
+    carries one (``workflow_run.caller_id``, see ``bound_caller``): an operator
+    or a wider agent resuming a reviewer's run cannot widen its steps. Only a
+    run that was started with no caller is bounded by the resumer.
 
     Un-reserves the B3-BR-10 stub. The algorithm (business-logic-model §3):
 
@@ -1516,7 +1886,8 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
        (output reused for templating), UNCONDITIONALLY reset every other state to
        ``PENDING`` (attempts=0, terminal_id=None, error=None, reprompted=False) so
        the failed step + its halted successors re-run with a fresh terminal
-       (B4-BR-10).
+       (B4-BR-10). Those steps' journaled ``result_json`` and ``terminal_id`` are
+       cleared too, so the run view never shows a previous attempt's answer.
     7. Re-enter the SAME Bolt-3 drive over the snapshotted spec's topo order (a
        single execution path, no resume/normal divergence — B4-RD-5). The drive
        skips non-``PENDING`` steps, so the reset above is the only resume-specific
@@ -1571,6 +1942,7 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         # The row existed above but the rebuild degraded it to absent (e.g.
         # corrupt inputs_json) — surface as unknown rather than resuming garbage.
         raise KeyError(f"unknown run_id '{run_id}'")
+    reset_step_ids: List[str] = []
     for st in record.step_states.values():
         if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
             continue  # keep done; output reused for {{steps.<id>.output.<field>}}
@@ -1580,12 +1952,18 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         st.terminal_id = None  # fresh terminal on re-run (B4-BR-10)
         st.error = None
         st.output = None
+        st.last_message = None
+        reset_step_ids.append(st.step_id)
 
     # Re-open the run and re-register the rebuilt record as the live cache.
     record.state = RunState.RUNNING
     record.cancelled = False
     record.current_step_id = None
     record.finished_at = None
+    # The ORIGINAL caller (journaled at start) keeps bounding the run; a resume by
+    # a different actor must not widen it. Only a run that was started with no
+    # caller (operator) takes the resumer's bound.
+    record.caller_id = bound_caller(row.caller_id, caller_id)
     run_registry[run_id] = record
     # Mark the drive live BEFORE the first await: the off-loop journal writes
     # below yield, and a concurrent resume for the same run_id must hit the
@@ -1594,6 +1972,9 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     # error, cancel, journal-write error).
     _active_drives.add(run_id)
     try:
+        # A step this resume runs again must not show the previous attempt's answer or
+        # terminal in the run view before it starts (best-effort, B4-BR-5).
+        await _ajournal(_journal_clear_step_view, record, reset_step_ids)
         try:
             await asyncio.to_thread(
                 workflow_journal.update_run_state, run_id, RunState.RUNNING.value, None
@@ -1620,8 +2001,12 @@ async def replay_single_step(
     run_id: str,
     step_id: str,
     prompt_override: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Re-execute ONE recorded step live, leaving the source run untouched (#640).
+
+    ``caller_id``: the terminal replaying the step, if an agent is; the replayed
+    worker is bounded by its delegation ceiling like any workflow step.
 
     The authoring loop this exists for: on a 57-step workflow, fixing two sentences
     of step 55's prompt should not cost a full re-run to reach step 55 again. The
@@ -1720,7 +2105,8 @@ async def replay_single_step(
 
     template = step.prompt if prompt_override is None else prompt_override
     try:
-        prompt = _substitute(template, record)
+        # The same builder the drive uses, so a replay sends the params block too.
+        prompt = _build_step_prompt(step, record, template)
     except WorkflowEngineError as e:
         # In a replay every unresolved reference is a PRECONDITION the caller can
         # act on — a predecessor never produced output, or an override names a step
@@ -1769,6 +2155,9 @@ async def replay_single_step(
     }
     try:
         try:
+            # No terminal recording here, unlike the drive: this call writes nothing for
+            # ``run_id`` (see the docstring), so the replay's terminal never lands on the
+            # recorded step's row or in its events. The payload carries ``terminal_id``.
             result = await run_agent_step(
                 provider=step.provider,
                 agent=step.agent,
@@ -1780,6 +2169,7 @@ async def replay_single_step(
                     "CAO_WORKFLOW_RUN_ID": replay_run_id,
                     "CAO_WORKFLOW_STEP_ID": step_id,
                 },
+                delegating_terminal_id=caller_id,
             )
         except StepExecutionError as e:
             # Recorded, not raised (the drive loop's posture). Deliberately NO retry
@@ -1815,6 +2205,12 @@ async def replay_single_step(
             # registry either: the in-process engine path dispatches no plugin hooks.
             if e.terminal_id is not None:
                 await _best_effort_teardown(e.terminal_id, None)
+        except DelegationCeilingError as e:
+            # The replayed worker would hold tools the replaying terminal may not
+            # delegate. Nothing ran and no terminal exists, so there is nothing to
+            # tear down; report it in the payload like any other step failure.
+            payload["error"] = str(e)
+            payload["error_kind"] = "error"
         except (TimeoutError, OutputExtractionError) as e:
             # Two terminal-layer failures ``run_agent_step`` propagates verbatim instead
             # of wrapping in ``StepExecutionError``, and both are the STEP failing rather

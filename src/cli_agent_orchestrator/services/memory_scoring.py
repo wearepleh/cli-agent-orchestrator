@@ -14,9 +14,13 @@ All factors are clamped to ``[0.0, 1.0]`` so the composite is bounded
 and future-dated timestamps.
 """
 
+import logging
 import math
+import threading
 from datetime import datetime, timezone
 from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 # Public weights — frozen for U4. Adjusting requires a new spec unit.
 W_BM25 = 0.50
@@ -31,8 +35,11 @@ USAGE_NORMALISER = 100
 
 # Whitelist for ``recall(sort_by=...)`` validation. Anything outside this
 # set raises ``ValueError`` — no silent fallback.
-SortBy = Literal["score", "recency", "usage"]
-SORT_BY_VALUES: frozenset = frozenset({"score", "recency", "usage"})
+SortBy = Literal["score", "recency", "usage", "relevance"]
+SORT_BY_VALUES: frozenset = frozenset({"score", "recency", "usage", "relevance"})
+DEFAULT_SORT_VALUES: frozenset = frozenset({"recency", "bm25"})
+_warned_invalid_default_sorts: set[tuple[str, str]] = set()
+_warned_invalid_default_sorts_lock = threading.Lock()
 
 # Scope precedence. Lower index = higher precedence in the
 # final scope-stable sort that runs AFTER score sorting in ``recall()``.
@@ -123,6 +130,22 @@ def validate_sort_by(sort_by: str) -> str:
     return sort_by
 
 
+def validate_default_sort(default_sort: object) -> str:
+    """Return a valid configured default sort, falling back safely to recency."""
+    if not isinstance(default_sort, str) or default_sort not in DEFAULT_SORT_VALUES:
+        warning_key = (type(default_sort).__qualname__, repr(default_sort))
+        with _warned_invalid_default_sorts_lock:
+            should_warn = warning_key not in _warned_invalid_default_sorts
+            _warned_invalid_default_sorts.add(warning_key)
+        if should_warn:
+            logger.warning(
+                "Invalid memory.ranking.default_sort=%r; using recency",
+                default_sort,
+            )
+        return "recency"
+    return str(default_sort)
+
+
 def scope_write_allowed(caller: str, target: str) -> bool:
     """Store-time scope guard.
 
@@ -145,3 +168,24 @@ def scope_write_allowed(caller: str, target: str) -> bool:
     # by design: "Cross-sibling writes (project caller → agent
     # scope) are rejected."
     return bool(SCOPE_RANK[caller] > SCOPE_RANK[target])
+
+
+# Defaults proposed in #861, not yet measured; validate before any default change.
+RELEVANCE_RECENCY_FLOOR = 0.85
+RELEVANCE_RECENCY_SCALE_DAYS = 30.0
+
+
+def relevance_recency_factor(
+    updated_at: datetime,
+    *,
+    now: datetime,
+    floor: float = RELEVANCE_RECENCY_FLOOR,
+    scale_days: float = RELEVANCE_RECENCY_SCALE_DAYS,
+) -> float:
+    """Bound project-native age's relative effect; naive timestamps mean UTC."""
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    days = max(0.0, (now - updated_at).total_seconds() / 86400.0)
+    return floor + (1.0 - floor) / (1.0 + days / scale_days)

@@ -7,7 +7,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.install import (
-    _copy_local_profile_to_store,
+    _read_local_profile,
     install,
 )
 from cli_agent_orchestrator.services.install_service import InstallResult
@@ -68,6 +68,7 @@ class TestInstallCommand:
             "developer",
             "kiro_cli",
             {"API_TOKEN": "secret-token"},
+            engine=None,
         )
 
     def test_install_without_provider_flag_passes_none_and_echoes_resolved_provider(
@@ -96,7 +97,7 @@ class TestInstallCommand:
 
         assert result.exit_code == 0
         assert "copilot_cli agent: /tmp/copilot/developer.agent.md" in result.output
-        mock_install.assert_called_once_with("developer", None, None)
+        mock_install.assert_called_once_with("developer", None, None, engine=None)
 
     def test_install_help_documents_provider_precedence(self, runner: CliRunner) -> None:
         """--provider help text should document flag > frontmatter > default."""
@@ -130,11 +131,13 @@ class TestInstallCommand:
     def test_install_file_source_prints_copy_confirmation(
         self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """File path installs should copy to the store and print a copy confirmation.
+        """File path installs hand the file's text to the service and print a copy confirmation.
 
-        File-handling lives entirely in the CLI: the service layer only sees
-        the validated bare stem. We verify the copy happened and the service
-        was called with the stem, not the original path.
+        File-handling lives entirely in the CLI: the service layer sees the
+        validated bare stem plus the text, never the path. The CLI itself
+        writes nothing -- the service stores the text once the ownership guard
+        has accepted it (round-6 review of #493), so a refused import cannot
+        replace the previously stored profile.
         """
         local_store = tmp_path / "agent-store"
         local_store.mkdir()
@@ -164,9 +167,12 @@ class TestInstallCommand:
         assert result.exit_code == 0, result.output
         assert "Copied agent from file to local store" in result.output
         assert "Agent 'local' installed successfully" in result.output
-        # Service sees the validated stem, never the full user path.
-        mock_install.assert_called_once_with("local", "kiro_cli", None)
-        assert (local_store / "local.md").read_text() == source_profile.read_text()
+        # Service sees the validated stem and the text, never the full user path.
+        mock_install.assert_called_once_with(
+            "local", "kiro_cli", None, profile_content=source_profile.read_text(), engine=None
+        )
+        # The CLI does not write the store; that is the service's job, after the guard.
+        assert not (local_store / "local.md").exists()
 
     def test_install_file_source_missing_file_fails_fast(
         self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -207,15 +213,44 @@ class TestInstallCommand:
         mock_install.assert_not_called()
 
     def test_install_failure_prints_error(self, runner: CliRunner) -> None:
-        """Service failures should be surfaced as CLI errors without raising."""
+        """A service failure is a CLI error: exit 1, the message on stderr (#1270)."""
         with patch(
             "cli_agent_orchestrator.cli.commands.install.install_agent",
             return_value=InstallResult(success=False, message="Source not found: missing"),
         ):
             result = runner.invoke(install, ["missing"])
 
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output  # a refusal exits 1 (#1270), not a crash
+        assert isinstance(result.exception, SystemExit), result.exception
         assert "Error: Source not found: missing" in result.output
+
+    def test_a_failed_install_exits_1_with_the_error_on_stderr(self, runner: CliRunner) -> None:
+        """#1270: a script must be able to tell a failed install from a good one."""
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=InstallResult(success=False, message="Agent profile not found: nope"),
+        ):
+            result = runner.invoke(install, ["nope", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 1
+        assert result.stderr.strip() == "Error: Agent profile not found: nope"
+        assert result.stdout == ""
+
+    def test_a_successful_install_still_exits_0(self, runner: CliRunner) -> None:
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=InstallResult(
+                success=True,
+                message="ok",
+                agent_name="developer",
+                context_file="/ctx/developer.md",
+            ),
+        ):
+            result = runner.invoke(install, ["developer"])
+
+        assert result.exit_code == 0, result.output
+        assert "Agent 'developer' installed successfully" in result.stdout
+        assert result.stderr == ""
 
     def test_install_invalid_env_format_returns_click_error(self, runner: CliRunner) -> None:
         """Assignments without '=' should fail validation with a user-friendly error."""
@@ -234,22 +269,22 @@ class TestInstallCommand:
         assert "Key must not be empty" in result.output
 
 
-class TestCopyLocalProfileToStore:
+class TestReadLocalProfile:
     """Tests for the file-handling helper that lives only in the CLI layer.
 
     This helper is the reason ``install_service.install_agent`` can keep a
-    narrow, bare-name-or-URL contract: the CLI copies user files into the
-    local store itself and then forwards just the validated stem.
+    narrow, bare-name-or-URL contract: the CLI reads user files itself and
+    forwards just the validated stem and the text.
     """
 
     def test_returns_none_for_url_source(self) -> None:
-        assert _copy_local_profile_to_store("https://example.com/a.md") is None
-        assert _copy_local_profile_to_store("http://example.com/a.md") is None
+        assert _read_local_profile("https://example.com/a.md") is None
+        assert _read_local_profile("http://example.com/a.md") is None
 
     def test_returns_none_for_bare_name(self) -> None:
-        assert _copy_local_profile_to_store("developer") is None
+        assert _read_local_profile("developer") is None
 
-    def test_copies_file_and_returns_stem(
+    def test_reads_file_and_returns_stem_and_text_without_writing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         store = tmp_path / "store"
@@ -259,10 +294,8 @@ class TestCopyLocalProfileToStore:
         src = tmp_path / "my-agent.md"
         src.write_text("body", encoding="utf-8")
 
-        stem = _copy_local_profile_to_store(str(src))
-
-        assert stem == "my-agent"
-        assert (store / "my-agent.md").read_text(encoding="utf-8") == "body"
+        assert _read_local_profile(str(src)) == ("my-agent", "body")
+        assert not store.exists()
 
 
 def test_install_omp_provider_is_accepted_by_cli():
@@ -283,4 +316,4 @@ def test_install_omp_provider_is_accepted_by_cli():
         result = runner.invoke(install, ["developer", "--provider", "omp"])
 
     assert result.exit_code == 0
-    mock_install.assert_called_once_with("developer", "omp", None)
+    mock_install.assert_called_once_with("developer", "omp", None, engine=None)

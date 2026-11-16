@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -18,12 +19,13 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.session_service import create_session, delete_session
 from cli_agent_orchestrator.services.terminal_service import (
+    TerminalRecordCorruptError,
     create_terminal,
     delete_terminal,
     send_input,
 )
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 def _registry_mock() -> MagicMock:
@@ -32,6 +34,22 @@ def _registry_mock() -> MagicMock:
     registry = MagicMock()
     registry.dispatch = AsyncMock()
     return registry
+
+
+def _persist_session_terminals(*terminal_ids: str) -> None:
+    """Seed legacy rows so teardown exercises real atomic incarnation binding.
+
+    An enumerated terminal must exist in the isolated database: fabricating only
+    its ID bypasses that contract and correctly fails before any backend kill.
+    """
+    for terminal_id in terminal_ids:
+        database.create_terminal(
+            terminal_id,
+            "cao-demo",
+            f"developer-{terminal_id[:4]}",
+            "kiro_cli",
+            agent_profile="developer",
+        )
 
 
 class TestSessionPluginEvents:
@@ -92,12 +110,10 @@ class TestSessionPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
         self,
         mock_tmux,
-        mock_list_terminals,
         mock_capture,
         mock_dismantle,
         mock_db_delete_terminal,
@@ -125,13 +141,27 @@ class TestSessionPluginEvents:
         )
         # One contained terminal so we can assert its teardown phases straddle
         # the session kill in the right order.
-        mock_list_terminals.return_value = [{"id": "abcd1234"}]
-        mock_capture.side_effect = lambda tid: (
+        _persist_session_terminals("abcd1234")
+
+        def record_snapshot(terminal_id):
+            # Legacy membership must be durably bound before snapshot or kill.
+            incarnation = database.get_session_incarnation("cao-demo")
+            assert incarnation is not None
+            assert database.get_terminal_metadata(terminal_id)["session_incarnation_id"] == (
+                incarnation
+            )
             call_order.append("capture_snapshot")
-            or {"tmux_session": "cao-demo", "tmux_window": "developer-abcd", "id": tid}
-        )
+            return {
+                "tmux_session": "cao-demo",
+                "tmux_window": "developer-abcd",
+                "id": terminal_id,
+            }
+
+        mock_capture.side_effect = record_snapshot
         mock_dismantle.side_effect = lambda *_args, **_kwargs: call_order.append("dismantle")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
+        mock_db_delete_terminal.side_effect = (
+            lambda *_, **__: call_order.append("db_delete") or True
+        )
         registry.dispatch.side_effect = record_dispatch
 
         result = delete_session("cao-demo", registry=registry)
@@ -161,10 +191,9 @@ class TestSessionPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_emits_post_kill_terminal_for_each_contained_terminal(
-        self, mock_tmux, mock_list_terminals, mock_capture, _dismantle, _db_delete, _sweep
+        self, mock_tmux, mock_capture, _dismantle, _db_delete, _sweep
     ):
         """Session teardown must emit one post_kill_terminal per terminal.
 
@@ -181,7 +210,7 @@ class TestSessionPluginEvents:
 
         mock_tmux.return_value.session_exists_strict.return_value = True
         mock_tmux.return_value.kill_session.return_value = True
-        mock_list_terminals.return_value = [{"id": "aaaa1111"}, {"id": "bbbb2222"}]
+        _persist_session_terminals("aaaa1111", "bbbb2222")
         mock_capture.side_effect = lambda tid: {
             "tmux_session": "cao-demo",
             "tmux_window": f"developer-{tid[:4]}",
@@ -202,10 +231,9 @@ class TestSessionPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_one_unusable_terminal_does_not_abort_the_completed_teardown(
-        self, mock_tmux, mock_list_terminals, mock_capture, _dismantle, _db_delete, _sweep
+        self, mock_tmux, mock_capture, _dismantle, _db_delete, _sweep
     ):
         """A terminal whose event cannot be BUILT must not fail the delete.
 
@@ -231,7 +259,7 @@ class TestSessionPluginEvents:
 
         mock_tmux.return_value.session_exists_strict.return_value = True
         mock_tmux.return_value.kill_session.return_value = True
-        mock_list_terminals.return_value = [{"id": "aaaa1111"}, {"id": "bbbb2222"}]
+        _persist_session_terminals("aaaa1111", "bbbb2222")
         mock_capture.side_effect = lambda tid: {
             "tmux_session": "cao-demo",
             "agent_profile": "developer",
@@ -260,10 +288,9 @@ class TestSessionPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_does_not_dispatch_when_the_kill_is_unconfirmed(
-        self, mock_tmux, mock_list_terminals, mock_capture, mock_dismantle, mock_db_delete_terminal
+        self, mock_tmux, mock_capture, mock_dismantle, mock_db_delete_terminal
     ):
         """A session that survives its kill must emit NOTHING and dismantle nothing.
 
@@ -275,7 +302,7 @@ class TestSessionPluginEvents:
         mock_tmux.return_value.session_exists_strict.return_value = True
         # kill_session reports failure and the session is still there afterwards.
         mock_tmux.return_value.kill_session.return_value = False
-        mock_list_terminals.return_value = [{"id": "abcd1234"}]
+        _persist_session_terminals("abcd1234")
         mock_capture.return_value = {
             "tmux_session": "cao-demo",
             "tmux_window": "developer-abcd",
@@ -287,6 +314,51 @@ class TestSessionPluginEvents:
         registry.dispatch.assert_not_awaited()
         mock_dismantle.assert_not_called()
         mock_db_delete_terminal.assert_not_called()
+
+    @pytest.mark.parametrize("persisted_session", [None, "cao-other"])
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_does_not_dispatch_when_incarnation_binding_fails(
+        self,
+        mock_tmux,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_db_delete_terminal,
+        mock_sweep,
+        persisted_session,
+    ):
+        """Unbindable membership must fail before killing or emitting events.
+
+        Unlike the successful lifecycle fixtures, this intentionally supplies a
+        row that is absent or belongs to another session. The real atomic
+        backfill must reject it rather than fabricating teardown ownership.
+        """
+        registry = _registry_mock()
+        if persisted_session is not None:
+            database.create_terminal("abcd1234", persisted_session, "developer-abcd", "kiro_cli")
+        mock_list_terminals.return_value = [{"id": "abcd1234"}]
+        mock_tmux.return_value.session_exists_strict.return_value = True
+        mock_tmux.return_value.kill_session.return_value = True
+
+        with pytest.raises(TerminalRecordCorruptError, match="Could not bind teardown incarnation"):
+            delete_session("cao-demo", registry=registry)
+
+        assert database.get_session_incarnation("cao-demo") is None
+        if persisted_session is not None:
+            metadata = database.get_terminal_metadata("abcd1234")
+            assert metadata["tmux_session"] == persisted_session
+            assert metadata["session_incarnation_id"] is None
+        mock_tmux.return_value.kill_session.assert_not_called()
+        mock_capture.assert_not_called()
+        mock_dismantle.assert_not_called()
+        mock_db_delete_terminal.assert_not_called()
+        mock_sweep.assert_not_called()
+        registry.dispatch.assert_not_awaited()
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -305,10 +377,9 @@ class TestSessionPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_sweep_recovered_row_still_gets_post_kill_terminal(
-        self, mock_tmux, mock_list_terminals, mock_capture, _dismantle, mock_db_delete, mock_sweep
+        self, mock_tmux, mock_capture, _dismantle, mock_db_delete, mock_sweep
     ):
         """A row whose FIRST delete raised but which the sweep removed is owed
         its event.
@@ -328,14 +399,14 @@ class TestSessionPluginEvents:
 
         mock_tmux.return_value.session_exists_strict.return_value = True
         mock_tmux.return_value.kill_session.return_value = True
-        mock_list_terminals.return_value = [{"id": "aaaa1111"}, {"id": "bbbb2222"}]
+        _persist_session_terminals("aaaa1111", "bbbb2222")
         mock_capture.side_effect = lambda tid: {
             "tmux_session": "cao-demo",
             "tmux_window": f"developer-{tid[:4]}",
             "agent_profile": "developer",
         }
         # The first terminal's row delete fails transiently; the peer's works.
-        mock_db_delete.side_effect = lambda tid: (
+        mock_db_delete.side_effect = lambda tid, **_: (
             (_ for _ in ()).throw(RuntimeError("database is locked")) if tid == "aaaa1111" else True
         )
         mock_sweep.return_value = None  # the sweep succeeds
@@ -354,10 +425,9 @@ class TestSessionPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_row_that_survives_the_sweep_too_gets_no_event(
-        self, mock_tmux, mock_list_terminals, mock_capture, _dismantle, mock_db_delete, mock_sweep
+        self, mock_tmux, mock_capture, _dismantle, mock_db_delete, mock_sweep
     ):
         """The inverse bound: if the sweep ALSO fails, the row survives and the
         event is NOT emitted — the surviving row is the retry handle, and the
@@ -371,7 +441,7 @@ class TestSessionPluginEvents:
 
         mock_tmux.return_value.session_exists_strict.return_value = True
         mock_tmux.return_value.kill_session.return_value = True
-        mock_list_terminals.return_value = [{"id": "aaaa1111"}]
+        _persist_session_terminals("aaaa1111")
         mock_capture.return_value = {
             "tmux_session": "cao-demo",
             "tmux_window": "developer-aaaa",
@@ -394,7 +464,7 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog", return_value="")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -444,6 +514,7 @@ class TestTerminalPluginEvents:
             side_effect=lambda: call_order.append("provider_initialize")
         )
         provider.shell_baseline = None
+        provider.identity_verified = True  # a healthy Kiro launch (#1074)
         mock_provider_manager.create_provider.return_value = provider
 
         log_path = MagicMock()
@@ -481,7 +552,7 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog", return_value="")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -552,10 +623,12 @@ class TestTerminalPluginEvents:
             "agent_profile": "developer",
         }
         mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
+        mock_db_delete_terminal.side_effect = (
+            lambda *_, **__: call_order.append("db_delete") or True
+        )
         registry.dispatch.side_effect = record_dispatch
 
-        deleted = delete_terminal("abcd1234", registry=registry)
+        deleted = delete_terminal("abcd1234", registry=registry, end_reason="deleted")
 
         assert deleted is True
         assert call_order[-2:] == ["db_delete", "dispatch"]
@@ -583,7 +656,7 @@ class TestTerminalPluginEvents:
         mock_db_delete_terminal.side_effect = RuntimeError("db delete failed")
 
         with pytest.raises(RuntimeError, match="db delete failed"):
-            delete_terminal("abcd1234", registry=registry)
+            delete_terminal("abcd1234", registry=registry, end_reason="deleted")
 
         registry.dispatch.assert_not_awaited()
 
@@ -705,9 +778,16 @@ class TestMessagePluginEvents:
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
 
-        inbox_service.deliver_pending("abcd1234", registry=registry)
+        # status_monitor is mocked bare here with no status_observation()
+        # configured, so the default-on submit confirmation (#78) would poll
+        # it forever and burn the real 8s timeout; this test is about event
+        # attribution, not that confirmation path.
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            inbox_service.deliver_pending("abcd1234", registry=registry)
 
-        mock_terminal_service.send_input.assert_called_once_with(
+        mock_terminal_service.dispatch_input.assert_called_once_with(
             "abcd1234",
             "Please review this",
             registry=registry,

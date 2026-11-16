@@ -26,16 +26,20 @@ jobs:
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1251). The job takes 25-40 min on main (3.11 is the
+    # slower leg), so 60 is 1.5x the slowest recent run. Unbounded, a hang held
+    # the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -46,18 +50,42 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --all-extras --dev
 
+      - name: Install Trivy for inventory regressions
+        if: matrix.python-version == '3.12'
+        uses: ./.github/actions/install-trivy
+
       - name: Run unit tests with coverage
+        # CAO_MUST_RUN names the assurance gates this leg owns; a `must_run`
+        # test for a listed gate that skips or gets deselected fails the session
+        # instead of passing silently (see test/_must_run.py). Only the 3.12 leg
+        # installs Trivy, so only the 3.12 leg claims the "unit" gate.
+        env:
+          CAO_MUST_RUN: ${{ matrix.python-version == '3.12' && 'unit' || '' }}
         run: |
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+            trivy --version
+          fi
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=xml \
+            --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
+        # --cov-branch (#1005) also makes --cov-fail-under read the BLENDED
+        # line+branch figure rather than line coverage. Whether that reads harder
+        # or softer than line-only depends on whether branch % is below or above
+        # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
+        # harder bar at 80 -- not an invariant, just the current numbers). The
+        # authoritative, separately-floored line metric is the ratchet's
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # job below. If the blend lands under 80 on a first run, lower THIS
+        # number -- do not drop the branch data, and do not touch the line floor.
 
       - name: Validate Markdown links
         run: uv run python scripts/validate_markdown_links.py
@@ -92,9 +120,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
@@ -113,6 +141,75 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: web
+
+      # =================================================================================
+      # WHEEL-CONTENTS GATE (issues #610, #705) — this job is the ONLY place in CI where
+      # test/test_wheel_contents.py can execute at all.
+      #
+      # `Unit Tests` runs pytest but never builds the web UI, and this job built the web UI
+      # but ran no pytest. test_wheel_contents.py is gated on the built web UI existing, so
+      # dropped into `Unit Tests` it reports SKIPPED in all three legs and no job in the
+      # workflow runs it. Here it runs exactly once.
+      #
+      # WHY HERE and not in `Unit Tests`: the property under test is Python-version
+      # independent (does hatchling's `[tool.hatch.build] artifacts` glob cover the whole
+      # web_ui/ build output), so running it on 3.11/3.12 would assert the same thing
+      # twice and build the web UI twice to do it. It also keeps the repo's
+      # primary test gate free of an npm-registry dependency. Follows the `CAO MCP Apps`
+      # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus targeted
+      # pytest files.
+      #
+      # SCOPE: the pytest step names its files EXPLICITLY, so it closes the gap for THOSE
+      # FILES and not for the class. Another web_ui-dependent test added elsewhere under
+      # test/ would still skip in `Unit Tests` and would not be collected here; wiring it
+      # in means naming it in this step too.
+      #
+      # test_hatch_artifacts_guard.py is listed alongside it, but is NOT dependent on this
+      # job: it never skips, so `Unit Tests` already runs it on 3.11/3.12. It is named
+      # here because this is the only job where `web_ui/` exists on disk, which is the only
+      # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
+      # =================================================================================
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # `--all-extras --dev`, not plain `uv sync`: `agui` is an optional extra and every
+      # other install site in this file passes both flags. Plain `uv sync` omits it and
+      # yields ~58 spurious agui collection failures.
+      - name: Install Python deps (for the wheel-contents packaging test)
+        run: uv sync --locked --all-extras --dev
+
+      - name: "Wheel-contents regression test (issues #610, #705)"
+        # The skip-guard is the load-bearing half. test_wheel_contents.py SKIPS when the
+        # built web UI is absent, and a skip keeps this job GREEN — the same false
+        # assurance the test exists to remove. `npm run build` exiting 0 while writing an
+        # incomplete tree is a failure this step exists to catch, so assert the
+        # precondition instead of trusting it.
+        #
+        # The guard calls `web_ui_build_is_complete()` from the test module rather than
+        # re-testing paths in shell: one source of truth, and it checks index.html AND
+        # every asset index.html loads (#705), not just the entry point.
+        #
+        # That import resolves `test` from the CURRENT DIRECTORY, so this step must stay at
+        # the repo root. The sibling steps in this job set `working-directory: web`; adding
+        # it here would fail with `ModuleNotFoundError: No module named 'test'`.
+        #
+        # Only these two files: the full suite already runs in `Unit Tests`, and the
+        # wheel build here is ~2s, so duplicating the suite would be pure waste.
+        run: |
+          uv run python -c 'import test.test_wheel_contents as t; raise SystemExit(0 if t.web_ui_build_is_complete() else 1)' || {
+            echo "The built web UI under src/cli_agent_orchestrator/web_ui/ is absent or incomplete" >&2
+            echo "after 'npm run build' (index.html missing, or it references assets that were" >&2
+            echo "not written). test/test_wheel_contents.py would SKIP rather than run, leaving" >&2
+            echo "this job green with the packaging assertion unexecuted (issues #610, #705)." >&2
+            exit 1
+          }
+          uv run pytest test/test_wheel_contents.py test/test_hatch_artifacts_guard.py --no-cov -q
 
   aidlc-portfolio-example:
     name: AI-DLC Portfolio Example
@@ -137,6 +234,11 @@ jobs:
   cao-mcp-apps:
     name: CAO MCP Apps
     runs-on: ubuntu-latest
+    # Bounds a hung test (#1273 review). "Backend coverage" below runs the same
+    # pytest suite as Unit Tests; over 60 runs this job took a mean of 33.3 min
+    # and a max of 37.9, so 60 matches Unit Tests and is 1.6x the slowest.
+    # Unbounded, a hang held the runner for GitHub's default of 360 min.
+    timeout-minutes: 60
 
     # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
     # vitest tiers (Phase II+) and CI can enforce them:
@@ -152,12 +254,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Set up Python
         run: uv python install 3.12
@@ -169,14 +271,16 @@ jobs:
         run: npm ci
         working-directory: cao_mcp_apps
 
+      # Was wrapped in `if ls src/**/*.ts src/**/*.tsx; then ... else echo "no
+      # TypeScript sources yet (Phase 0)"; fi`. Phase 0 is over: there are 29
+      # .ts/.tsx files under src/{agent,dashboard,event-stream,graph,shared,test},
+      # so the else branch is dead. It was also fragile in the direction this PR
+      # cares about -- bash does not expand `**` recursively without `globstar`,
+      # so `src/**/*.ts` only ever matched one level down, and moving the sources
+      # one directory deeper would have silently turned tsc into an echo.
       - name: Type check
         working-directory: cao_mcp_apps
-        run: |
-          if ls src/**/*.ts src/**/*.tsx >/dev/null 2>&1; then
-            npm run typecheck
-          else
-            echo "no TypeScript sources yet (Phase 0) — skipping tsc"
-          fi
+        run: npm run typecheck
 
       - name: Unit tests
         working-directory: cao_mcp_apps
@@ -199,14 +303,18 @@ jobs:
         run: uv run pytest test/test_http_only_boundary.py -q
 
       - name: Backend coverage (for the ratchet floor)
-        # Produces coverage.json (python floor) consumed by coverage:ratchet.
+        # Produces coverage.json (python line + branch floors) consumed by
+        # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
+        # totals; the ratchet floors line and branch SEPARATELY (#1005).
         run: |
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=json \
+            --cov-fail-under=80 \
             -q
 
       - name: Coverage ratchet
@@ -216,6 +324,10 @@ jobs:
   cao-mcp-apps-e2e:
     name: CAO MCP Apps E2E (Playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
 
     # E2E tier budget (Requirement 20.3): 60s per test (enforced in
     # playwright.config.ts via `timeout: 60_000`).
@@ -227,15 +339,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 10
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install MCP-apps deps
+        timeout-minutes: 10
         run: npm ci
         working-directory: cao_mcp_apps
 
       - name: Install Playwright browser (chromium)
+        # The image has the browser; this only confirms it. No apt step.
+        timeout-minutes: 10
         run: npm run test:e2e:install
         working-directory: cao_mcp_apps
 
@@ -254,7 +370,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -266,53 +382,87 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/ examples/ag-ui/cao-dojo/tools/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/robotics/hierarchical-factory/ examples/skills/ examples/ag-ui/cao-dojo/tools/
 
-      - name: Run type checker with mypy
-        run: uv run mypy src/
-        # Pre-existing repo-wide mypy errors (agent_scaffold/profile/
-        # memory_service — unrelated to AG-UI) are tolerated as non-blocking on
-        # main; this PR introduces none. Mirror main's policy so Code Quality
-        # stays green rather than silently making mypy a hard gate here.
-        continue-on-error: true
+      # The dead-code gate (#1005). BLOCKING, like the mypy ratchet step below:
+      # the selected rules (F401 unused import, F841 unused local, F821/F822
+      # undefined name -- a removed import still used in the SAME file; ruff is
+      # per-file, cross-module uses are the import guard's and the unit tests'
+      # job) are green on main as of this change, so any new finding is
+      # introduced by the PR under test.
+      #
+      # Scope is wider than black/isort above on purpose -- all of examples/, not
+      # just the robotics example -- because an unread binding in an example is
+      # still an unread binding, and ruff has nothing to say about formatting so
+      # the broader scope costs no churn. Rule selection and the deliberately
+      # deferred rules (F811, ARG, B) are documented in pyproject.toml.
+      - name: Lint for dead code with ruff
+        run: uv run ruff check src/ test/ examples/
+
+      - name: Run type checker with mypy (ratchet)
+        # Issue #1005. This step used to be `uv run mypy src/` with
+        # `continue-on-error: true`, so a red type check blocked nothing and the
+        # repo's 177 pre-existing errors were indistinguishable from 178.
+        #
+        # The ratchet blocks on NEW errors only, measured per file per error code
+        # against the committed `mypy-baseline.json`. Pre-existing errors pass,
+        # counts that fall pass (and the step tells you to bank them with
+        # `--update`), counts that rise fail. The full `mypy src/` output is
+        # echoed to this log before the verdict.
+        #
+        # Deliberately NO `continue-on-error` here: that key is the entire
+        # difference between a gate and a decoration, and
+        # test/scripts/test_mypy_ratchet.py asserts it stays absent.
+        run: uv run python scripts/mypy_ratchet.py
 
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        timeout-minutes: 10
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
+        timeout-minutes: 10
         run: uv python install 3.12
 
       - name: Install dependencies (cao-server for the live AG-UI surface)
+        timeout-minutes: 10
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 10
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
-      - name: Install ffmpeg (GIF export)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
       - name: Install recorder deps
+        timeout-minutes: 10
+        # ffmpeg (GIF export) is the ffmpeg-static npm binary, so no apt install.
         run: npm ci
         working-directory: examples/ag-ui/ag-ui-eventsource-viewer/tools
 
       - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
         run: npm run playwright:install
         working-directory: examples/ag-ui/ag-ui-eventsource-viewer/tools
+
+      - name: Remove the committed GIF (the upload must see only this run's GIF)
+        run: rm -f docs/media/ag-ui-eventsource-viewer-demo.gif
 
       - name: Record demo (renders the six components + refusal; gates on drift)
         # The recorder boots a CAO_AGUI_ENABLED cao-server + a static server,
@@ -323,45 +473,56 @@ jobs:
         working-directory: examples/ag-ui/ag-ui-eventsource-viewer/tools
 
       - name: Upload demo GIF artifact
+        # The recorder's exit code (CI=true) is the gate. The committed GIF is removed above,
+        # so the artifact is always this run's recording and a missing GIF fails here too.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ag-ui-eventsource-viewer-demo
           path: docs/media/ag-ui-eventsource-viewer-demo.gif
-          if-no-files-found: warn
-        continue-on-error: true
+          if-no-files-found: error
 
   ag-ui-construct-demos:
     name: AG-UI construct demos (shift-left recordings)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        timeout-minutes: 10
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
+        timeout-minutes: 10
         run: uv python install 3.12
 
       - name: Install dependencies (constructs + examples run under uv)
+        timeout-minutes: 10
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 10
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install recorder deps
+        timeout-minutes: 10
         # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
         # no apt install is needed here.
         run: npm ci
         working-directory: examples/ag-ui/ag-ui-construct-demos/tools
 
       - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
         run: npm run playwright:install
         working-directory: examples/ag-ui/ag-ui-construct-demos/tools
 
@@ -375,7 +536,7 @@ jobs:
 
       - name: Upload construct demo GIFs artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ag-ui-construct-demos
           path: docs/media/ag-ui-*-demo.gif
@@ -385,41 +546,55 @@ jobs:
   agent-plugins-dogfood:
     name: Agent Plugins dog-food (shift-left recording)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
+    env:
+      # run.sh's JSON assertions use this interpreter; uv sync above creates it.
+      CAO_DOGFOOD_PYTHON: ${{ github.workspace }}/.venv/bin/python
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        timeout-minutes: 10
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python
+        timeout-minutes: 10
         run: uv python install 3.12
 
       - name: Install dependencies (cao runs the dog-food pipeline under uv)
+        timeout-minutes: 10
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        timeout-minutes: 10
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install recorder deps
+        timeout-minutes: 10
         # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
         # no apt install is needed here.
         run: npm ci
         working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
 
       - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
         run: npm run playwright:install
         working-directory: examples/agent-plugins/agent-plugins-dogfood/tools
 
       - name: Record dog-food demo (asserts the plugin pipeline; gates on drift)
         # Runs run.sh OFFLINE (no provider binary, network, or secrets) — CAO
         # installing its own `cao` plugin through its own pipeline — and asserts
-        # validate/add/install(Kiro+OpenCode)/remove, exporting
+        # validate/add/install(Kiro+OpenCode)/remove, then validate/add/remove for
+        # every other package in build_agent_plugin.py's PACKAGES, exporting
         # docs/media/agent-plugins-dogfood-demo.gif. A non-zero exit or a missing
         # PASS marker (the pipeline regressed) fails this job — the shift-left
         # gate. The live OpenCode observational step (CAO_DOGFOOD_LIVE=1, needs
@@ -429,7 +604,7 @@ jobs:
 
       - name: Upload dog-food demo GIF artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-plugins-dogfood
           path: docs/media/agent-plugins-dogfood-demo.gif
@@ -439,12 +614,15 @@ jobs:
   ag-ui-stock-client-live:
     name: AG-UI stock-client live (AC3)
     runs-on: ubuntu-latest
+    # The CAO Dojo trace steps below start a cao-server and mock_cli terminals;
+    # every wait inside them is bounded, and this bounds the job as a whole.
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -456,17 +634,162 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js (for the @ag-ui/client stock SDK)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
+
+      - name: Install tmux (the CAO Dojo trace check launches mock_cli terminals)
+        # Not assumed on the runner image: ubuntu-latest is moving to a new release.
+        # apt retries with a short per-request timeout; the step bound fails a stalled mirror fast.
+        timeout-minutes: 5
+        run: |
+          command -v tmux || {
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux
+          }
+
+      - name: Install the pinned @ag-ui/client from the lockfile
+        # Before run.sh, so run.sh finds node_modules and skips its unlocked
+        # `npm install`: the demo and the trace lane below run on the locked 1.0.3.
+        run: npm ci --no-audit --no-fund
+        working-directory: examples/ag-ui/ag-ui-stock-client-live
 
       - name: Run stock-client live demo (asserts >=1 post-connect frame)
         # Boots a CAO_AGUI_ENABLED cao-server with a keyless mock_cli fleet,
         # POSTs a RunAgentInput to /agui/v1/run with the pinned @ag-ui/client
         # HttpAgent, and asserts a live frame is received (AC3 / spec task 17.2).
+        # It then checks the ambient stream (GET/POST /agui/v1/stream) with the
+        # same SDK's verifyEvents (verify-ambient.mjs): the streams the
+        # conformance tests capture, plus one live HttpAgent run.
         # Non-zero exit fails the job; the script cleans up the server on exit.
         run: ./examples/ag-ui/ag-ui-stock-client-live/run.sh
 
+      - name: CAO Dojo approve/reject/none e2e, keyless, and tier-2 drift check (#1116)
+        # Records the three captures against an isolated cao-server with mock_cli
+        # answering a scripted approval prompt (no credentials), asserts each
+        # capture's outcome, side effect and the leak rule, then compares the
+        # recording's shape with the committed shape file. Exit 1 prints DRIFT and
+        # the keyless command that regenerates the shape.
+        run: >-
+          uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --mock --check
+          --emit "$RUNNER_TEMP/cao-dojo-mock-trace.ndjson"
+
+      - name: CAO Dojo node lane's known-gap rule (a union across traces, like the Python lane)
+        # The end-to-end cases need the pinned @ag-ui/client installed above, so they
+        # run here; Unit Tests runs the same file and skips them without it.
+        # CAO_MUST_RUN names the assurance gate this step owns: any skip of a
+        # must_run("agui-node") test fails the step (test/_must_run.py).
+        run: uv run pytest test/examples/test_cao_dojo_verify_trace_node.py -q --no-cov -rs
+        env:
+          CAO_MUST_RUN: agui-node
+
+      - name: CAO Dojo trace through upstream enforceEvents and verifyEvents (tier 1, node)
+        run: |
+          published=examples/ag-ui/cao-dojo/trace/cao-dojo-trace.ndjson
+          [ -f "$published" ] || published=
+          node examples/ag-ui/ag-ui-stock-client-live/verify-trace.mjs \
+            "$RUNNER_TEMP/cao-dojo-mock-trace.ndjson" $published
+
+      - name: CAO Dojo published-trace debt (warns here; blocks on the release path)
+        run: uv run python examples/ag-ui/cao-dojo/tools/record_trace.py --check-debt --warn
+
+  ag-ui-operator-dashboard:
+    name: AG-UI operator dashboard
+    runs-on: ubuntu-latest
+    # Playwright's pinned image (the @playwright/test version the job uses): the browsers
+    # and their system libraries are already in it, so no apt install runs here.
+    container: mcr.microsoft.com/playwright:v1.64.1-noble
+    # Bounds a hung e2e: the job normally takes a few minutes.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/ag-ui/ag-ui-operator-dashboard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The keyless e2e drives real mock_cli terminals, which need tmux. The Playwright
+      # image does not ship it, so the step below installs it (bounded, see its comment).
+      - name: Install tmux
+        # apt runs as root (the image has no sudo), with retries and a short per-request
+        # timeout; the step has its own time bound, so a stalled mirror fails fast.
+        timeout-minutes: 5
+        run: |
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends tmux
+
+      - name: Install uv
+        timeout-minutes: 10
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        timeout-minutes: 10
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao-server + agui run plane)
+        timeout-minutes: 10
+        working-directory: .
+        run: uv sync --locked --all-extras --dev
+
+      # Node 22: the e2e runs e2e/e2e.ts with --experimental-strip-types.
+      - name: Set up Node.js
+        timeout-minutes: 10
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: examples/ag-ui/ag-ui-operator-dashboard/package-lock.json
+
+      - name: Install app dependencies (exact pins, install scripts off)
+        timeout-minutes: 10
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Dependency checks
+        run: npm run test:dependencies
+
+      - name: Type check
+        run: npm run typecheck
+
+      # Codecov ingests only the Python coverage.xml, so it never sees this
+      # TypeScript. vite.config.ts holds core/ to 100% lines, branches,
+      # functions and statements; a drop fails this step.
+      - name: Unit tests with coverage floor
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      # A private cao-server (temp HOME, own tmux server, port 9896) with mock_cli
+      # terminals. SIMULATED: an agent showing a prompt. The harness types the
+      # marker "APPROVAL_REQUIRED: <text>" into a pane without Enter, standing in
+      # for a CLI that prints a permission prompt and waits. COVERED FOR REAL: the
+      # approval bridge, classification, the run plane, resume and key delivery.
+      # See examples/ag-ui/ag-ui-operator-dashboard/e2e/README.md.
+      # Chromium for the timeline screenshot (e2e/timeline.spec.ts). npm ci runs with
+      # install scripts off, so the browser is an explicit step, as in the AG-UI
+      # eventsource viewer's recorder job.
+      - name: Install Playwright browser (chromium)
+        timeout-minutes: 10
+        run: npm run playwright:install
+
+      - name: Keyless e2e (cao-server + mock_cli terminals) and the timeline screenshot
+        run: ./e2e/run.sh
+
+      # Evidence from the browser step, kept even when the e2e fails. Non-blocking:
+      # the e2e step above is the gate, not this upload.
+      - name: Upload dashboard e2e evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ag-ui-operator-dashboard-e2e-evidence
+          path: |
+            examples/ag-ui/ag-ui-operator-dashboard/e2e/artifacts/
+            examples/ag-ui/ag-ui-operator-dashboard/e2e/test-results/
+          if-no-files-found: warn
+        continue-on-error: true
   # =======================================================================================
   # RUST TUI (issue #321, unit `rust-ci`). THE FIRST JOB IN ci.yml THAT INSPECTS THE RUST
   # CRATE AT ALL — measured before this change: `cargo` appeared in only
@@ -538,7 +861,7 @@ jobs:
       #
       # Same SHA pin `wheel-matrix` resolved for the smoke-test job, reused rather than
       # re-resolved (SR-5). (#321)
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -605,7 +928,7 @@ jobs:
       # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
       # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -715,65 +1038,80 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Generate requirements.txt for scanning
         run: |
           uv export --locked --format requirements-txt > requirements.txt
 
-      # SR-4 (interview Q1): `exit-code: 1` makes this job FAIL on a CRITICAL/HIGH finding.
-      # Before this, the step had no exit-code, so it uploaded SARIF and continued — meaning
-      # "Security Scan passed" attested that a scan COMPLETED, not that it was clean. The
-      # rest of the repo already treats scanners as gates: secret-scan.yml passes
-      # `--exit-code 1` to gitleaks at both :68 and :82. This closes the inconsistency
-      # rather than introducing a new policy. (#321)
-      #
-      # SARIF is still produced and uploaded (see the next step's `if: always()`), so the
-      # Security tab keeps its history even on a failing run.
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.69.3
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
+      # REPORT (never fails on findings): every severity, both default scanners, so the Security
+      # tab keeps MEDIUM/LOW history (#568 DR-5). Runs BEFORE both gates, so a red gate still
+      # leaves a SARIF for the `if: always()` upload below.
+      - name: Trivy report (SARIF, all severities)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
-          exit-code: '1'
+          exit-code: '0'
+          skip-setup-trivy: true
 
-      # FR-8: the SARIF step above writes findings to a FILE, so a failing scan
-      # logs an exit code and names nothing — diagnosing #568 took an out-of-band
-      # `gh api .../code-scanning/alerts` call to learn what had failed. This step
-      # re-runs the same scan in table format so the finding appears in the log.
-      #
-      # `if: failure()` — runs only when the gate above fails, so a green run pays
-      # nothing. `exit-code: '0'` — this step must not be the one that fails the
-      # job; the gate above already did, and a second failure would obscure which
-      # step is authoritative.
-      #
-      # No `severity:` input, matching the effective gate: trivy-action's
-      # entrypoint.sh unsets TRIVY_SEVERITY whenever format is sarif, so the step
-      # above scans at ALL severities. Passing CRITICAL,HIGH here would print a
-      # narrower set than the one that failed the build — and could print NOTHING
-      # while the job is red.
-      - name: Show Trivy findings in the log
-        if: failure()
+      # SECRET GATE: FAIL on a committed secret of ANY severity (Security Scan's policy since
+      # #321, kept on purpose). Trivy's `severity:` filter applies to every scanner in a run, so
+      # the CRITICAL/HIGH/UNKNOWN gate below would let a MEDIUM/LOW secret (e.g. a JWT) through.
+      # No `severity:` input here = no TRIVY_SEVERITY = every severity gates. gitleaks
+      # (secret-scan.yml) scans PR ranges only, not pushes to main.
+      - name: Trivy secret gate (all severities)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'secret'
+          format: 'table'
+          exit-code: '1'
+          skip-setup-trivy: true
+
+      # VULNERABILITY GATE (SR-4, #321): FAIL on a fixable CRITICAL, HIGH or UNKNOWN finding.
+      # UNKNOWN = advisory not yet scored: it gates until scored, then follows its real severity.
+      # Fixable MEDIUM/LOW are report-only (#568 OQ-1). Table format honours `severity:`
+      # (trivy-action only discards it for SARIF) and prints what failed (FR-8).
+      - name: Trivy gate (CRITICAL/HIGH/UNKNOWN)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           format: 'table'
+          severity: 'CRITICAL,HIGH,UNKNOWN'
           ignore-unfixed: true
-          exit-code: '0'
+          exit-code: '1'
+          skip-setup-trivy: true
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v3
-        # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding
-        # would fail the scan step and SKIP the upload, hiding the very finding that failed
-        # the build from the Security tab.
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v3
+        # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL/HIGH
+        # finding would fail the gate step and SKIP the upload, hiding the very finding that
+        # failed the build from the Security tab.
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
+
+  dependency-security:
+    name: Dependency Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/dependency-security
 
   dependency-review:
     name: Dependency Review
@@ -790,37 +1128,25 @@ jobs:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
 
-# NOTE: CodeQL runs via GitHub's "default setup" (visible as the `Analyze (...)`
-# checks on every PR). Adding a workflow-based CodeQL job here would conflict
-# with default setup ("CodeQL analyses from advanced configurations cannot be
-# processed when the default setup is enabled") and fail uploads. To widen the
-# query suite beyond the default, toggle default setup off in
-# Settings → Code security → CodeQL default setup and re-add a workflow job.
-#
-# ---------------------------------------------------------------------------------------
-# RUST SAST IS AN ACCEPTED, NAMED GAP — considered and declined, not forgotten (SR-6,
-# interview Q6; issue #321).
-#
-# There is deliberately NO Rust static-analysis/scanning job in this file. The reason is the
-# constraint recorded immediately above: CodeQL here runs via default setup, and a
-# workflow-based scanning job that uploads SARIF conflicts with it and fails the upload. So
-# adding one would not buy Rust SAST — it would break the analysis that already runs.
-#
-# What covers the Rust code instead, and it is genuinely less than SAST:
-#   - `cargo clippy --locked --all-targets -- -D warnings` (the `rust` job) — a hard gate,
-#     linting TEST targets as well as the binary. The per-site escape hatch is
-#     `#[allow(lint_name)]` plus an issue-number comment (SR-3), never a global relaxation.
-#   - `#![forbid(unsafe_code)]` at tui/src/main.rs line 1 — memory-safety classes that SAST
-#     would hunt for cannot be expressed in this crate at all. It is a compile-time refusal,
-#     not a warning.
-#   - `cargo-deny` (.github/workflows/cargo-deny.yml) — RustSec advisories over the whole
-#     resolved graph, weekly as well as per-PR. That is dependency CVE coverage, which is a
-#     different axis from first-party static analysis.
-#
-# WHAT REMAINS UNCOVERED: first-party Rust logic flaws — taint flow into a subprocess argv,
-# an injection path through a constructed command, a TOCTOU on a file the TUI writes. clippy
-# is a lint pass, not a dataflow analysis, and will not find those. Unit `rust-ci` treats this
-# as an accepted gap rather than papering over it; to close it, toggle CodeQL default setup off
-# (Rust is supported by CodeQL) and add a single advanced-configuration job covering Python and
-# Rust together.
-# ---------------------------------------------------------------------------------------
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript, python, rust]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run CodeQL analysis
+        uses: ./.github/actions/codeql
+        with:
+          language: ${{ matrix.language }}

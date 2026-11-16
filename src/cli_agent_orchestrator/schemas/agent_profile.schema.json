@@ -37,13 +37,18 @@
     },
     "engine": {
       "type": "string",
-      "enum": ["v2", "kas"],
-      "description": "Kiro engine selection."
+      "enum": ["v2", "v3", "kas"],
+      "description": "Kiro engine selection. 'kas' is an alias of 'v3' and is stored as 'v3'."
     },
     "allowedTools": {
       "type": "array",
       "items": {"type": "string"},
       "description": "CAO tool vocabulary allowlist."
+    },
+    "delegateTools": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Delegation ceiling: the most this agent may grant to workers it creates via assign, handoff or a workflow step (same vocabulary as allowedTools). Defaults to ['*'] for role supervisor and to the agent's own allowedTools otherwise. See docs/tool-restrictions.md."
     },
     "mcpServers": {
       "type": "object",
@@ -96,9 +101,22 @@
     "claudeConfig": {
       "type": "object"
     },
+    "kiroConfig": {
+      "type": "object"
+    },
     "hermesProfile": {
       "type": "string",
       "minLength": 1
+    },
+    "kimiSwarm": {
+      "type": ["boolean", "null"],
+      "description": "Kimi Code only. Override native Swarm startup activation; omission or null inherits the operator default. Requires a vetted executable when enabled and grants no additional tools."
+    },
+    "kimiSwarmMaxConcurrency": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 10,
+      "description": "Kimi Code only. Concurrent native subagents per batch. Omission or null inherits the managed policy; an explicit limit requires executable verification."
     },
     "grokNativeWorkflows": {
       "type": "boolean",
@@ -138,6 +156,111 @@
       "additionalProperties": {"type": "string"},
       "description": "Extra environment variables injected into this agent's terminal at launch (e.g. {\"CLAUDE_CONFIG_DIR\": \"/home/me/.claude-b\"}). Values are passed verbatim, with no shell or ~ expansion, so use absolute paths. CAO's runtime identity variables cannot be set here. Consumed by CAO at terminal creation; not passed through to provider JSON."
     },
+    "params": {
+      "type": "object",
+      "description": "CAO-native. The params a workflow step that uses this profile must fill, by name. Never passed to provider JSON. Step values are journaled in plaintext, so a param never holds a secret. The profile validator also checks that a default is one of the enum values, and that a string default or enum value has no {{...}} placeholder.",
+      "maxProperties": 32,
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$",
+        "not": {"type": "string", "pattern": "[\\r\\n]"},
+        "description": "A param name starts with a letter and has at most 64 characters: letters, digits, '_', '.' and '-'."
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["string", "int", "bool"],
+            "default": "string",
+            "description": "The type of the step's value. The value is always written as a quoted string."
+          },
+          "required": {
+            "type": "boolean",
+            "default": false,
+            "description": "Whether every step that uses this profile must set the param."
+          },
+          "default": {
+            "description": "The value the workflow builder fills in: a string, a whole number or a boolean, matching type. It is one of the enum values when enum is set."
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 200,
+            "not": {"type": "string", "pattern": "[\\r\\n]"},
+            "description": "A param description is one line of at most 200 characters."
+          },
+          "enum": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "description": "The values a step may use: 1 to 32 distinct values of the declared type."
+          }
+        },
+        "allOf": [
+          {
+            "if": {"type": "object", "properties": {"type": {"const": "string"}}},
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "not": {"type": "string", "pattern": "[\\r\\n]"},
+                  "description": "A string value is one line of at most 512 characters."
+                },
+                "enum": {
+                  "items": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "not": {"type": "string", "pattern": "[\\r\\n]"},
+                    "description": "A string value is one line of at most 512 characters."
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {"type": "object", "properties": {"type": {"const": "int"}}, "required": ["type"]},
+            "then": {
+              "properties": {
+                "default": {
+                  "type": "integer",
+                  "minimum": -999999999999999999,
+                  "maximum": 999999999999999999
+                },
+                "enum": {
+                  "items": {
+                    "type": "integer",
+                    "minimum": -999999999999999999,
+                    "maximum": 999999999999999999
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {"type": "object", "properties": {"type": {"const": "bool"}}, "required": ["type"]},
+            "then": {
+              "properties": {"default": {"type": "boolean"}},
+              "not": {"required": ["enum"]},
+              "description": "A bool param cannot have an enum."
+            }
+          },
+          {
+            "if": {"type": "object", "properties": {"required": {"const": true}}, "required": ["required"]},
+            "then": {
+              "not": {"required": ["default"]},
+              "description": "A required param cannot have a default."
+            }
+          },
+          {
+            "$comment": "uniqueItems runs only on an enum within maxItems. jsonschema compares items it cannot sort pair by pair, so an unbounded list would cost quadratic time.",
+            "if": {"type": "object", "properties": {"enum": {"type": "array", "maxItems": 32}}, "required": ["enum"]},
+            "then": {"properties": {"enum": {"uniqueItems": true}}}
+          }
+        ]
+      }
+    },
     "prompt": {
       "type": "string"
     },
@@ -150,6 +273,11 @@
     },
     "useLegacyMcpJson": {
       "type": "boolean"
+    },
+    "x-cao-source-stem": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "CAO-generated context-copy provenance. Records the original profile source stem."
     }
   },
   "additionalProperties": false

@@ -1,8 +1,6 @@
 """Tests for terminal snapshot-on-delete and restore command."""
 
 import json
-import tempfile
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,10 +39,10 @@ class TestSnapshotOnDelete:
         mock_tmux.get_pane_working_directory.return_value = "/home/user/project"
         mock_db_delete.return_value = True
 
-        delete_terminal("abc12345")
+        delete_terminal("abc12345", end_reason="deleted")
 
         mock_tmux.get_history.assert_called_once_with(
-            "cao-test", "dev-abc1", strip_escapes=True, full_history=True
+            "cao-test", "dev-abc1", strip_escapes=True, full_history=True, join_wrapped=True
         )
         scrollback = (tmp_path / "abc12345.scrollback").read_text()
         assert scrollback == "line1\nline2\nline3"
@@ -79,7 +77,7 @@ class TestSnapshotOnDelete:
         mock_db_delete.return_value = True
 
         # Should not raise
-        result = delete_terminal("abc12345")
+        result = delete_terminal("abc12345", end_reason="deleted")
         assert result is True
         mock_tmux.kill_window.assert_called_once()
 
@@ -163,7 +161,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 result = runner.invoke(terminal, ["restore", "abc12345"])
 
@@ -185,7 +183,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get",
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get",
                 side_effect=requests.exceptions.ConnectionError(),
             ):
                 result = runner.invoke(terminal, ["restore", "abc12345"])
@@ -224,7 +222,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",
@@ -255,7 +253,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",
@@ -289,7 +287,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",
@@ -330,7 +328,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",

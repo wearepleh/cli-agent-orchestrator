@@ -1,24 +1,23 @@
 """Tests for the database client."""
 
 import sqlite3
-import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
-    FlowModel,
     IdempotencyKeyModel,
     InboxModel,
     MemoryMetadataModel,
     TerminalModel,
+    count_runtime_allocated_terminals,
     create_flow,
     create_inbox_message,
     create_terminal,
@@ -26,6 +25,7 @@ from cli_agent_orchestrator.clients.database import (
     delete_idempotency_key,
     delete_terminal,
     delete_terminals_by_session,
+    fail_orphaned_pending_messages,
     get_flow,
     get_idempotency_record,
     get_inbox_messages,
@@ -43,6 +43,8 @@ from cli_agent_orchestrator.clients.database import (
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_deferred_init_failure,
+    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_group,
     update_terminal_metadata,
     update_terminal_shell_command,
@@ -75,6 +77,51 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+    def test_runtime_capacity_excludes_reclaimed_deferred_tombstone(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+            create_terminal("dead0001", "cao-dead", "w-dead", "kimi_cli")
+            assert count_runtime_allocated_terminals() == 2
+
+            assert update_terminal_deferred_init_runtime_reclaimed("dead0001", True)
+
+            assert count_runtime_allocated_terminals() == 1
+
+    def test_terminal_exists_is_true_only_for_a_terminal_row(self, test_db):
+        # The AG-UI ambient stream asks this before announcing a sender as a
+        # subagent; labels such as "operator" and "supervisor" are not terminals.
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+            assert db_mod.terminal_exists("live0001") is True
+            assert db_mod.terminal_exists("operator") is False
+            assert db_mod.terminal_exists("supervisor") is False
+            assert db_mod.terminal_exists("") is False
+
+    def test_get_terminal_label_names_only_a_terminal_row(self, test_db):
+        # The AG-UI ambient stream names a terminal it first meets mid-replay
+        # from this, instead of the generic "terminal".
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli", agent_profile="developer")
+            assert db_mod.get_terminal_label("live0001") == {
+                "agent_profile": "developer",
+                "provider": "kimi_cli",
+            }
+            assert db_mod.get_terminal_label("operator") is None
+            assert db_mod.get_terminal_label("") is None
+
+    def test_session_incarnation_backfill_is_atomic_when_any_row_is_missing(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+
+            assert (
+                db_mod.update_terminals_session_incarnation(["live0001", "missing1"], "inc-current")
+                is False
+            )
+            assert get_terminal_metadata("live0001")["session_incarnation_id"] is None
+
+            assert db_mod.update_terminals_session_incarnation(["live0001"], "inc-current") is True
+            assert get_terminal_metadata("live0001")["session_incarnation_id"] == "inc-current"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):
@@ -176,9 +223,17 @@ class TestTerminalOperations:
 
         assert result is False
 
+    @patch("cli_agent_orchestrator.clients.database._finalize_launch_records_best_effort")
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminal(self, mock_session_class):
-        """Test deleting a terminal."""
+    def test_delete_terminal(self, mock_session_class, mock_finalize):
+        """Test deleting a terminal.
+
+        ``_finalize_launch_records_best_effort`` (issue #1082) is mocked out: it
+        runs its own separate SessionLocal() + commit() AFTER this one, which
+        would otherwise double the commit count this test pins. Its own
+        behavior is covered in test/clients/test_launch_record.py and
+        test/services/test_launch_record_integration.py.
+        """
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
@@ -188,10 +243,11 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminal("test123")
+        result = delete_terminal("test123", end_reason="deleted")
 
         assert result is True
         mock_session.commit.assert_called_once()
+        mock_finalize.assert_called_once_with(["test123"], "deleted")
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminal_not_found(self, mock_session_class):
@@ -205,7 +261,7 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminal("nonexistent")
+        result = delete_terminal("nonexistent", end_reason="deleted")
 
         assert result is False
 
@@ -223,10 +279,15 @@ class TestTerminalOperations:
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
         mock_terminal.working_directory = "/workspace/project"
+        mock_terminal.deferred_init_failure_json = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_terminal]
+        # The listing outer-joins the #1225 keep table and reads (row, kept_until) pairs.
+        selection = mock_query.filter.return_value.order_by.return_value
+        selection.outerjoin.return_value.add_columns.return_value.all.return_value = [
+            (mock_terminal, None)
+        ]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -262,8 +323,9 @@ class TestTerminalOperations:
         Uses the real in-memory DB (not a mocked session) so the age cutoff,
         status filter, and terminal join are actually exercised.
         """
-        old = datetime.now() - timedelta(seconds=120)
-        fresh = datetime.now()
+        # Server timestamps are UTC.
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
 
         with test_db() as seed:
             seed.add_all(
@@ -321,6 +383,96 @@ class TestTerminalOperations:
 
         assert result == ["term-old"]
 
+    def test_fail_orphaned_pending_messages(self, test_db):
+        """A PENDING message whose receiver row is gone is failed, not left
+        claiming PENDING forever (#708).
+
+        The reconcile join deliberately drops these so the sweep does not retry
+        deliveries to deleted agents; this is the counterpart that stops them
+        reporting a state they can never leave.
+        """
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
+
+        with test_db() as seed:
+            seed.add_all(
+                [
+                    TerminalModel(
+                        id="term-alive",
+                        tmux_session="cao-s",
+                        tmux_window="w",
+                        provider="kiro_cli",
+                    ),
+                    # Receiver alive — still the sweep's to deliver.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-alive",
+                        message="alive",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                    # Receiver row gone and past the grace window — undeliverable.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="ghost",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                    # Receiver row gone but inside the grace window — left alone.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="ghost-fresh",
+                        status=MessageStatus.PENDING.value,
+                        created_at=fresh,
+                    ),
+                    # Already delivered to a gone receiver — not touched.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="done",
+                        status=MessageStatus.DELIVERED.value,
+                        created_at=old,
+                    ),
+                ]
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            failed_ids = fail_orphaned_pending_messages(30)
+
+        with test_db() as check:
+            by_message = {m.message: m.status for m in check.query(InboxModel).all()}
+
+        assert len(failed_ids) == 1
+        assert by_message["ghost"] == MessageStatus.FAILED.value
+        assert by_message["alive"] == MessageStatus.PENDING.value
+        assert by_message["ghost-fresh"] == MessageStatus.PENDING.value
+        assert by_message["done"] == MessageStatus.DELIVERED.value
+
+    def test_fail_orphaned_pending_messages_is_a_noop_without_orphans(self, test_db):
+        """No orphans, no writes — the sweep runs every 30s."""
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="term-alive", tmux_session="cao-s", tmux_window="w", provider="kiro_cli"
+                )
+            )
+            seed.add(
+                InboxModel(
+                    sender_id="a",
+                    receiver_id="term-alive",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+                )
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert fail_orphaned_pending_messages(30) == []
+
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminals_by_session(self, mock_session_class):
         """Test deleting all terminals in a session."""
@@ -333,7 +485,7 @@ class TestTerminalOperations:
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminals_by_session("cao-session")
+        result = delete_terminals_by_session("cao-session", end_reason="session_teardown")
 
         assert result == 2
 
@@ -647,6 +799,9 @@ class TestGroupAndMetadata:
         mock_terminal.allowed_tools = None
         mock_terminal.group = '["tenant_1", "project_5"]'
         mock_terminal.metadata_json = '{"task": "reviewing PR"}'
+        mock_terminal.deferred_init_failure_json = (
+            '{"phase": "deferred_init", "kind": "provider_init_error", "message": "failed"}'
+        )
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -658,6 +813,11 @@ class TestGroupAndMetadata:
 
         assert result["group"] == ["tenant_1", "project_5"]
         assert result["metadata"] == {"task": "reviewing PR"}
+        assert result["deferred_init_failure"] == {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "failed",
+        }
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_update_terminal_group(self, mock_session_class):
@@ -745,6 +905,36 @@ class TestGroupAndMetadata:
         assert result is False
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_deferred_init_failure_is_separate_from_metadata(
+        self, mock_session_class
+    ):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.metadata_json = '{"origin":"bridge"}'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "workspace trust required",
+        }
+        result = update_terminal_deferred_init_failure("test123", failure)
+
+        assert result is True
+        assert mock_terminal.deferred_init_failure_json == (
+            '{"phase": "deferred_init", "kind": "provider_init_error", '
+            '"message": "workspace trust required"}'
+        )
+        assert mock_terminal.metadata_json == '{"origin":"bridge"}'
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_group_returns_decoded_list(self, mock_session_class):
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
@@ -810,6 +1000,8 @@ class TestListSiblingsByGroupPrefix:
                     tmux_session="s",
                     tmux_window="w",
                     provider="kiro_cli",
+                    model="model-x",
+                    model_honored=True,
                     group='["tenant_1", "project_5", "folder_1"]',
                     metadata_json='{"task": "reviewing"}',
                 ),
@@ -818,6 +1010,8 @@ class TestListSiblingsByGroupPrefix:
                     tmux_session="s",
                     tmux_window="w",
                     provider="kiro_cli",
+                    model="model-y",
+                    model_honored=False,
                     group='["tenant_1", "project_5", "folder_2"]',
                 ),
                 TerminalModel(
@@ -839,6 +1033,7 @@ class TestListSiblingsByGroupPrefix:
         assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
         assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
         assert by_id["sib-2"]["metadata"] is None
+        assert all(set(sibling) == {"id", "group", "metadata"} for sibling in result)
 
     def test_caller_excluded_from_its_own_results(self, test_db):
         self._seed(
@@ -1432,8 +1627,6 @@ class TestFlowOperations:
 
         mock_session.refresh.side_effect = mock_refresh
 
-        from cli_agent_orchestrator.clients.database import get_flows_to_run
-
         next_run = datetime.now()
         result = create_flow(
             name="test-flow",
@@ -1645,6 +1838,103 @@ class TestFlowOperations:
             create_inbox_message("sender-123", "dead-terminal", "Hello")
 
 
+class TestGetInboxMessagesOrdering:
+    """Ordering and sender filtering for get_inbox_messages."""
+
+    def _seed(self, test_db):
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="supervisor",
+                message="oldest",
+                status=MessageStatus.PENDING.value,
+                created_at=base,
+            ),
+            InboxModel(
+                sender_id="worker-b",
+                receiver_id="supervisor",
+                message="middle",
+                status=MessageStatus.DELIVERED.value,
+                created_at=base + timedelta(minutes=1),
+            ),
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="supervisor",
+                message="newest-a",
+                status=MessageStatus.PENDING.value,
+                created_at=base + timedelta(minutes=2),
+            ),
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="other",
+                message="other-inbox",
+                status=MessageStatus.PENDING.value,
+                created_at=base + timedelta(minutes=3),
+            ),
+        ]
+        with test_db() as session:
+            session.add_all(rows)
+            session.commit()
+
+    def test_default_order_is_oldest_first(self, test_db):
+        """The default stays oldest-first and does not cross receivers."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor")
+
+        assert [message.message for message in messages] == ["oldest", "middle", "newest-a"]
+
+    def test_newest_first_applies_limit_after_ordering(self, test_db):
+        """newest_first returns the latest row when limit is 1."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", limit=1, newest_first=True)
+
+        assert [message.message for message in messages] == ["newest-a"]
+
+    def test_explicit_oldest_first_still_limits_from_the_start(self, test_db):
+        """newest_first=False keeps limit applied to the oldest rows."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", limit=1, newest_first=False)
+
+        assert [message.message for message in messages] == ["oldest"]
+
+    def test_sender_filter_excludes_other_senders(self, test_db):
+        """sender_id returns only that sender's messages for the receiver."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", sender_id="worker-b")
+
+        assert [message.message for message in messages] == ["middle"]
+        assert messages[0].sender_id == "worker-b"
+
+    def test_sender_filter_combines_with_status_order_and_limit(self, test_db):
+        """sender_id, status, newest_first, and limit apply together."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages(
+                "supervisor",
+                limit=1,
+                status=MessageStatus.PENDING,
+                sender_id="worker-a",
+                newest_first=True,
+            )
+
+        assert [message.message for message in messages] == ["newest-a"]
+        assert messages[0].status == MessageStatus.PENDING
+
+    def test_pending_messages_stay_oldest_first(self, test_db):
+        """get_pending_messages keeps delivering the oldest pending message."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_pending_messages("supervisor", limit=1)
+
+        assert [message.message for message in messages] == ["oldest"]
+        assert messages[0].status == MessageStatus.PENDING
+
+
 class TestInitDb:
     """Tests for init_db function."""
 
@@ -1690,11 +1980,24 @@ class TestTerminalsSchemaMigration:
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
-            rows = conn.execute("SELECT id, caller_id, working_directory FROM terminals").fetchall()
+            rows = conn.execute(
+                "SELECT id, caller_id, working_directory, model, model_honored FROM terminals"
+            ).fetchall()
         assert "caller_id" in columns
         assert "working_directory" in columns
         assert "provider_variant" in columns
-        assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
+        assert "deferred_init_failure" in columns
+        assert "deferred_init_external_owner" in columns
+        assert "deferred_init_runtime_reclaimed" in columns
+        assert "session_incarnation_id" in columns
+        assert {"model", "model_honored"} <= columns
+        assert "delegate_tools" in columns
+        assert rows == [
+            ("abc12345", None, None, None, None)
+        ], "existing rows must get NULL launch-model values"
+        with sqlite3.connect(str(db_file)) as conn:
+            ceilings = conn.execute("SELECT delegate_tools FROM terminals").fetchall()
+        assert ceilings == [(None,)], "pre-migration rows have no recorded ceiling"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -1725,6 +2028,14 @@ class TestTerminalsSchemaMigration:
         assert columns.count("working_directory") == 1
         assert columns.count("allowed_tools") == 1
         assert columns.count("provider_variant") == 1
+        assert columns.count("deferred_init_failure") == 1
+        assert columns.count("deferred_init_external_owner") == 1
+        assert columns.count("deferred_init_runtime_reclaimed") == 1
+        assert columns.count("delegate_tools") == 1
+        assert columns.count("session_incarnation_id") == 1
+        assert columns.count("model") == 1
+        assert columns.count("model_honored") == 1
+        assert columns.count("identity_verified") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -1876,6 +2187,10 @@ class TestTerminalsSchemaMigration:
                 assert row["group"] is None, "pre-migration rows must read group as NULL"
                 assert row["metadata"] is None, "pre-migration rows must read metadata as NULL"
                 assert row["provider_variant"] is None
+                assert row["model"] is None
+                assert row["model_honored"] is None
+                # Legacy rows, never False: the Kiro input gate grandfathers them (#1074).
+                assert row["identity_verified"] is None
 
             # Original pre-migration data must survive untouched.
             assert aaaa["tmux_session"] == "cao-sess-1"
@@ -1897,6 +2212,17 @@ class TestTerminalsSchemaMigration:
         assert columns.count("group") == 1
         assert columns.count("metadata") == 1
         assert columns.count("provider_variant") == 1
+        assert columns.count("model") == 1
+        assert columns.count("model_honored") == 1
+        # create_all adds new tables to old databases, including decision records.
+        with sqlite3.connect(str(db_file)) as conn:
+            indexes = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = ?"
+                " AND name NOT LIKE 'sqlite_autoindex%'",
+                ("decision_records",),
+            ).fetchone()[0]
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert "decision_records" in tables and indexes == 3
 
 
 class TestTerminalMetadataRoundTrip:
@@ -1951,6 +2277,64 @@ class TestTerminalMetadataRoundTrip:
         assert fetched is not None
         assert fetched["caller_id"] is None
         assert fetched["working_directory"] is None
+
+    def test_session_incarnation_round_trips_through_all_session_reads(self, tmp_path, monkeypatch):
+        """Durable session incarnation identity is returned by every session read."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'incarnation.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal(
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "kiro_cli",
+            session_incarnation_id="inc-123",
+        )
+        assert created["session_incarnation_id"] == "inc-123"
+
+        fetched = get_terminal_metadata("abc12345")
+        assert fetched is not None
+        assert fetched["session_incarnation_id"] == "inc-123"
+        assert list_terminals_by_session("cao-s")[0]["session_incarnation_id"] == "inc-123"
+        assert list_terminals_in_sessions(["cao-s"])[0]["session_incarnation_id"] == "inc-123"
+
+    @pytest.mark.parametrize("model_honored", [True, False])
+    def test_launch_model_round_trips_through_terminal_record(
+        self, tmp_path, monkeypatch, model_honored
+    ):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'model.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal(
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "mock_cli" if not model_honored else "codex",
+            model="model-x",
+            model_honored=model_honored,
+        )
+        fetched = get_terminal_metadata("abc12345")
+        listed = list_terminals_by_session("cao-s")
+
+        assert created["model"] == "model-x"
+        assert created["model_honored"] is model_honored
+        assert fetched is not None
+        assert fetched["model"] == "model-x"
+        assert fetched["model_honored"] is model_honored
+        assert listed[0]["model"] == "model-x"
+        assert listed[0]["model_honored"] is model_honored
 
 
 class TestProjectAliasMigration:
@@ -2307,7 +2691,7 @@ class TestListTerminalsInSessions:
         """
         self._add(db, "f0000000", "cao-alpha", agent_profile="supervisor")
         self._add(db, "20000000", "cao-alpha", agent_profile="developer")
-        delete_terminal("20000000")  # frees the max rowid
+        delete_terminal("20000000", end_reason="deleted")  # frees the max rowid
         self._add(db, "10000000", "cao-alpha", agent_profile="developer")
 
         result = list_terminals_in_sessions(["cao-alpha"])
@@ -2339,13 +2723,25 @@ class TestListTerminalsInSessions:
         # Keys pinned absolutely, not just against each other — a key dropped
         # from BOTH projections would otherwise pass while breaking consumers.
         assert set(batched[0]) == {
+            "description",
             "id",
             "tmux_session",
             "tmux_window",
             "provider",
             "agent_profile",
+            "model",
+            "model_honored",
+            "ephemeral",
             "working_directory",
             "engine",
+            "deferred_init_failure",
+            "deferred_init_external_owner",
+            "deferred_init_runtime_reclaimed",
+            "session_incarnation_id",
+            # #1131: the stored Kiro identity record, None for other providers.
+            "identity_verified",
+            # #1225: end of a kept child's window, None when not kept.
+            "kept_until",
             "last_active",
         }
 
@@ -2442,3 +2838,75 @@ def test_no_upsert_against_the_terminals_table():
         "upsert against terminals would break the ownership ordering contract "
         "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
     )
+
+
+class TestPendingInboxCounts:
+    def test_empty_receivers_do_not_open_database(self):
+        with patch.object(db_mod, "SessionLocal") as factory:
+            assert db_mod.get_pending_inbox_counts([]) == {}
+        factory.assert_not_called()
+
+    def test_receivers_without_pending_messages(self, test_db):
+        with test_db() as db:
+            db.add(
+                InboxModel(
+                    sender_id="sender",
+                    receiver_id="empty",
+                    message="done",
+                    status=MessageStatus.DELIVERED.value,
+                )
+            )
+            db.commit()
+        with patch.object(db_mod, "SessionLocal", test_db):
+            assert db_mod.get_pending_inbox_counts(["empty", "missing"]) == {}
+
+    def test_counts_are_exact_grouped_and_independent_of_sender(self, test_db):
+        # Inbox persistence has no orchestration-type column: all delivery modes
+        # share these rows and the counter must not inspect their payloads.
+        with test_db() as db:
+            for receiver, count in [("first", 123), ("second", 2), ("excluded", 5)]:
+                db.add(
+                    TerminalModel(
+                        id=receiver,
+                        tmux_session="synthetic-session",
+                        tmux_window=receiver,
+                        provider="codex",
+                    )
+                )
+                for index in range(count):
+                    db.add(
+                        InboxModel(
+                            sender_id=f"sender-{index % 3}",
+                            receiver_id=receiver,
+                            message=f"synthetic message {index}",
+                            status=MessageStatus.PENDING.value,
+                        )
+                    )
+                for status in (MessageStatus.DELIVERED, MessageStatus.FAILED):
+                    db.add(
+                        InboxModel(
+                            sender_id="sender",
+                            receiver_id=receiver,
+                            message="not pending",
+                            status=status.value,
+                        )
+                    )
+            db.commit()
+        statements = []
+        engine = test_db.kw["bind"]
+
+        def observe(conn, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", observe)
+        try:
+            with patch.object(db_mod, "SessionLocal", test_db):
+                assert db_mod.get_pending_inbox_counts(["first", "second", "missing"]) == {
+                    "first": 123,
+                    "second": 2,
+                }
+        finally:
+            event.remove(engine, "before_cursor_execute", observe)
+        assert len(statements) == 1
+        assert "GROUP BY" in statements[0].upper()

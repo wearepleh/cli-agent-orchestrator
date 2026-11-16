@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
-from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -75,7 +74,7 @@ class _FakeBus:
     async def drain(self, queue):
         # Yield nothing so the stream finishes immediately.
         return
-        yield  # noqa: make it an async generator
+        yield  # unreachable, but it is what makes this an async generator
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +218,8 @@ def test_run_write_scope_allows_resume(monkeypatch):
     )
 
     # Even though the interrupt doesn't exist, we should get past the auth gate
-    # and receive a streaming response (the error will be in the stream)
+    # and receive a streaming response. AG-UI 1.0 says the run proceeds without
+    # an unrecognised entry (#1191), so the stream finishes normally.
     emitter = RecordingUiEmitter()
     construct = AgentHandoffWithApproval(emitter=emitter, answer_delivery=None)
     app.state.approval_bridge = _FakeBridge(construct)
@@ -240,11 +240,11 @@ def test_run_write_scope_allows_resume(monkeypatch):
             json=body,
             headers={"Authorization": "Bearer test-token"},
         )
-        # Should be 200 (streaming) with RUN_ERROR in the stream
+        # Should be 200 (streaming); the unknown entry is skipped with a warning
         assert resp.status_code == 200
         frames = _parse_sse_frames(resp.text)
         assert frames[0]["type"] == "RUN_STARTED"
-        assert frames[1]["type"] == "RUN_ERROR"
+        assert frames[-1]["type"] == "RUN_FINISHED"
     finally:
         if hasattr(app.state, "approval_bridge"):
             del app.state.approval_bridge
@@ -361,7 +361,7 @@ def test_run_resume_approve_via_http():
 
 
 def test_run_resume_unknown_interrupt_via_http():
-    """Resume with unknown interrupt produces RUN_ERROR in stream."""
+    """Resume with an unknown interrupt proceeds without it (AG-UI 1.0, #1191)."""
     emitter = RecordingUiEmitter()
     construct = AgentHandoffWithApproval(emitter=emitter, answer_delivery=None)
 
@@ -385,8 +385,9 @@ def test_run_resume_unknown_interrupt_via_http():
         types = [f["type"] for f in frames]
 
         assert types[0] == "RUN_STARTED"
-        assert types[1] == "RUN_ERROR"
-        assert "does-not-exist" in frames[1]["message"]
+        assert "RUN_ERROR" not in types
+        assert types[-1] == "RUN_FINISHED"
+        assert frames[-1]["outcome"] == {"type": "success"}
     finally:
         del app.state.approval_bridge
 

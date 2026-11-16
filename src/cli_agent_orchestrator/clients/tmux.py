@@ -8,19 +8,28 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar
+from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar, Union
 
 import libtmux
+import psutil
 from libtmux.constants import PaneDirection
 from libtmux.exc import LibTmuxException
 from libtmux.pane import Pane
 from libtmux.session import Session
 from libtmux.window import Window
 
+from cli_agent_orchestrator.backends.base import (
+    TerminalCleanupOutcome,
+    TerminalCleanupResult,
+)
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    SESSION_PREFIX,
+    TMUX_HISTORY_LIMIT,
     TMUX_HISTORY_LINES,
 )
+from cli_agent_orchestrator.utils import fifo_writer
+from cli_agent_orchestrator.utils.forwarded_env import is_hijack_env_key
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -43,6 +52,16 @@ logger = logging.getLogger(__name__)
 # isolated from each other here. Treat it as a label, not a credential.
 TERMINAL_MARK_OPTION = "@cao_terminal"
 
+# The terminal's CAO terminal id, written at creation to the tmux object that
+# owns the terminal: a pane-scoped option for a terminal sharing a host window,
+# a window-scoped option for a terminal that IS its window. This is what makes
+# teardown identity-first. TERMINAL_MARK_OPTION above carries the terminal NAME,
+# which is reusable; this carries the id, which is not, so "the pane at the name
+# I remember" and "the pane this terminal owns" stop being the same question.
+# Same provenance caveat as the mark: an object that can reach the socket can
+# set it, so it is a scope identifier, not a credential.
+TERMINAL_ID_OPTION = "@cao_terminal_id"
+
 # How a pane-mode window is re-arranged after each spawn, and the split that
 # feeds it. The split direction is not separately configurable because
 # ``select-layout`` overrides it — splitting sideways and then laying out
@@ -63,6 +82,19 @@ NO_RELAYOUT = "none"
 
 # Holds the most panes of the four, which is what a fleet needs.
 DEFAULT_PANE_LAYOUT = "tiled"
+
+# What a person reads off the window. tmux expands a user option inside a
+# format, so the border can show the mark itself -- the one label an agent
+# cannot overwrite, unlike pane_title, which a TUI rewrites on startup. Built
+# from TERMINAL_MARK_OPTION so renaming the mark cannot leave the border
+# silently reading an option nothing sets. A pane somebody split by hand has no
+# mark, and falls back to its index rather than showing an empty border.
+BORDER_STATUS_OPTION = "pane-border-status"
+BORDER_FORMAT_OPTION = "pane-border-format"
+BORDER_STATUS_TOP = "top"
+BORDER_CAPTION_FORMAT = (
+    " #{?" + TERMINAL_MARK_OPTION + ",#{" + TERMINAL_MARK_OPTION + "},#{pane_index}} "
+)
 
 
 class PaneSpawnUnavailable(RuntimeError):
@@ -393,6 +425,261 @@ def _tmux_server_liveness(socket_path: str) -> str:
     return _SERVER_UNKNOWN
 
 
+# ── Browser terminal views ───────────────────────────────────────────────
+#
+# A tmux session has ONE current window, shared by every client attached to it.
+# A browser terminal that ran ``attach-session -t <session>:<window>`` therefore
+# switched the window for every other client on that session: two web panes on
+# agents of the same session showed the same window, and an operator attached
+# from a real terminal had their view flipped too.
+#
+# Each browser terminal instead gets its own throwaway "view" session holding
+# only the agent's window, linked (not moved) with ``link-window``. Properties:
+#   * independent: each view has its own current window, so panes never follow
+#     each other and the agent's own session is not touched;
+#   * self-closing: when the agent's window is killed it is unlinked from every
+#     session, the view is left empty and tmux destroys it, so the browser sees
+#     the connection close instead of being dropped onto some other agent;
+#   * self-cleaning: ``destroy-unattached`` removes the view once its single
+#     client (the WebSocket's PTY) goes away.
+# Views are named WEB_VIEW_PREFIX + random hex, which does not start with
+# SESSION_PREFIX, so session listings never report them as CAO sessions. They
+# carry WEB_VIEW_OWNER_OPTION = the agent session's name, which is how
+# ``kill_session`` finds and removes them first (a window still linked into a
+# view would otherwise outlive its session).
+WEB_VIEW_PREFIX = "caoweb-"
+WEB_VIEW_OWNER_OPTION = "@cao_web_view_of"
+_WEB_VIEW_PLACEHOLDER = "_cao_view_placeholder"
+
+
+def is_web_view_session(name: Optional[str]) -> bool:
+    return bool(name) and name.startswith(WEB_VIEW_PREFIX)  # type: ignore[union-attr]
+
+
+def web_view_attach_argv(
+    session_name: str,
+    source_window: str,
+    view_name: Optional[str] = None,
+) -> List[str]:
+    """tmux argv that attaches a fresh view session showing ``source_window``.
+
+    ``source_window`` is a tmux window target (``session:window`` or ``@id``).
+    A new session needs an initial window; a short-lived placeholder is created,
+    replaced by the linked window, and killed before anything attaches. Bare
+    ``;`` arguments separate tmux commands within the one invocation. If the
+    link fails, tmux stops the sequence before attaching and the placeholder
+    session exits with its ``sleep``.
+
+    A view is a new session, so it starts from tmux's *global* options, not the
+    agent session's. Two of those matter here and are set on the view itself:
+      * ``mouse on``: what ``create_session`` sets on agent sessions (#546).
+        Without it xterm.js turns wheel ticks into Up/Down keys, which walk the
+        agent's prompt history or move a permission menu's selection.
+      * ``detach-on-destroy on``: when the view is destroyed (its window was
+        killed) the client exits instead of switching to another session, so
+        "self-closing" holds whatever the operator's tmux.conf says.
+
+    Pane spawn mode needs no pane selection here: the window holds every pane
+    and tmux keeps one active pane per window, not per client, so the WebSocket
+    handler selects the terminal's pane itself (see ``web_view_attach_plan``).
+    Keeping the chain free of a pane target also means a pane that vanishes
+    mid-attach cannot stop the chain after the view exists, which would have
+    left the view behind without ``destroy-unattached``.
+    """
+    view = view_name or f"{WEB_VIEW_PREFIX}{uuid.uuid4().hex[:12]}"
+    return [
+        "tmux",
+        "-u",
+        "new-session",
+        "-d",
+        "-s",
+        view,
+        "-n",
+        _WEB_VIEW_PLACEHOLDER,
+        "sleep 60",
+        ";",
+        "set-option",
+        "-t",
+        view,
+        WEB_VIEW_OWNER_OPTION,
+        session_name,
+        ";",
+        "set-option",
+        "-t",
+        view,
+        "mouse",
+        "on",
+        ";",
+        "set-option",
+        "-t",
+        view,
+        "detach-on-destroy",
+        "on",
+        ";",
+        "link-window",
+        "-s",
+        source_window,
+        "-t",
+        f"{view}:",
+        ";",
+        "kill-window",
+        "-t",
+        f"{view}:{_WEB_VIEW_PLACEHOLDER}",
+        ";",
+        "attach-session",
+        "-t",
+        view,
+        ";",
+        # Only once attached: set on an unattached session it destroys it at once.
+        "set-option",
+        "-t",
+        view,
+        "destroy-unattached",
+        "on",
+    ]
+
+
+def web_view_owner(
+    name: Optional[str], read_owner: Callable[[str], Optional[str]]
+) -> Optional[str]:
+    """The agent session a session name stands for, seen from inside its pane.
+
+    Inside an agent's pane, ``tmux display-message -p '#S'`` names the most
+    recently active session holding the pane's window. While a browser view
+    of that window is attached, that is the ``caoweb-*`` view, not the agent's
+    session. Views carry their owner in WEB_VIEW_OWNER_OPTION; ``read_owner``
+    reads it. Any other name is returned unchanged.
+    """
+    if not is_web_view_session(name):
+        return name
+    owner = read_owner(name)  # type: ignore[arg-type]
+    return owner or None
+
+
+def _require_cao_session_name(session_name: str, action: str) -> None:
+    """Refuse a destructive tmux action on a session CAO did not create.
+
+    CAO shares the operator's default tmux server, so a name reaching a kill
+    here could be a personal session. Every session CAO creates starts with
+    ``SESSION_PREFIX`` (``terminal_service.create_terminal`` prepends it), so
+    the prefix is the ownership test. Raised as ``ValueError`` rather than
+    returned as ``False``: callers read False as "not confirmed gone" and go
+    on to re-check liveness, which would turn a refused kill into a confusing
+    "session still alive" failure.
+    """
+    if not session_name.startswith(SESSION_PREFIX):
+        raise ValueError(
+            f"refusing to {action} tmux session {session_name!r}: CAO only acts on "
+            f"sessions it created, and those start with {SESSION_PREFIX!r}"
+        )
+
+
+def _foreground_process_group(pid: int) -> Optional[int]:
+    """Return the foreground process group of the controlling tty of ``pid``, or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            # After "pid (comm)": state ppid pgrp session tty_nr tpgid ...
+            fields = stat_file.read().rsplit(b")", 1)[1].split()
+        return int(fields[5])
+    except (OSError, IndexError, ValueError):
+        pass  # no procfs (macOS): ask ps
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "tpgid=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _command_inside_pty_proxy(pane_pid: int) -> Optional[str]:
+    """Return the name of the program that runs inside a PTY proxy, or None.
+
+    A PTY proxy starts the real shell in a new session, on the inner tty. So
+    the pane process is a proxy when one of its children is a shell in another
+    session than the pane process. The program in the foreground of the inner
+    tty is the answer, or the shell itself at its prompt. A background child of
+    the shell (a prompt helper such as gitstatusd) is not.
+
+    The session, not ``psutil.Process.terminal()``, identifies the inner tty:
+    psutil reads the tty names once per process, so a cao-server that is
+    already running does not see the tty of a pane that it opens later.
+
+    Returns None when the pane process is not a proxy, or when the process
+    table cannot be read. The caller then keeps the name that tmux reported.
+    """
+    try:
+        session = os.getsid(pane_pid)
+        descendants = psutil.Process(pane_pid).children(recursive=True)
+    except (psutil.Error, OSError):
+        return None
+
+    by_parent: Dict[int, List[psutil.Process]] = {}
+    for process in descendants:
+        try:
+            by_parent.setdefault(process.ppid(), []).append(process)
+        except psutil.Error:
+            continue  # exited during the scan
+
+    def started(process: psutil.Process) -> float:
+        try:
+            return process.create_time()
+        except psutil.Error:
+            return 0.0
+
+    shells = []
+    for child in by_parent.get(pane_pid, []):
+        try:
+            if (
+                os.getsid(child.pid) != session
+                and child.name() in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+            ):
+                shells.append(child)
+        except (psutil.Error, OSError):
+            continue
+    if not shells:
+        return None
+    shell = max(shells, key=started)
+
+    try:
+        shell_session = os.getsid(shell.pid)
+        shell_name = shell.name()
+    except (psutil.Error, OSError):
+        return None
+    jobs = []
+    for child in by_parent.get(shell.pid, []):
+        try:
+            if os.getsid(child.pid) == shell_session:
+                jobs.append((child, os.getpgid(child.pid)))
+        except (psutil.Error, OSError):
+            continue
+
+    foreground = _foreground_process_group(shell.pid)
+    if foreground is not None and foreground > 0:
+        try:
+            if foreground == os.getpgid(shell.pid):
+                return shell_name
+        except OSError:
+            return None
+        for child, group in jobs:
+            if group == foreground:
+                try:
+                    return child.name()
+                except psutil.Error:
+                    return None
+    # The foreground group is unknown: the newest job, or the shell at its prompt.
+    if not jobs:
+        return shell_name
+    try:
+        return max((child for child, _group in jobs), key=started).name()
+    except psutil.Error:
+        return None
+
+
 class TmuxClient:
     """Simplified tmux client for basic operations."""
 
@@ -487,6 +774,125 @@ class TmuxClient:
         if result.returncode != 0:
             logger.warning(
                 "failed to set tmux server option 'exit-empty off': %s",
+                "; ".join(result.stderr) or f"tmux exited {result.returncode}",
+            )
+
+    def _read_server_history_limit(self) -> Optional[int]:
+        """Read the shared server's current global ``history-limit``.
+
+        ``start-server ; show-options`` in ONE invocation, for the reason
+        :meth:`_set_server_exit_empty_off` documents: on a clean socket a bare
+        ``show-options`` finds no server and fails, and the caller could not
+        tell "nothing to preserve" from "could not tell". Starting the server
+        first also sources the operator's ``.tmux.conf``, so a ``history-limit
+        100000`` set there is read as the live value and preserved, instead of
+        being overwritten by the ``set-option`` that follows ``start-server``.
+
+        Returns ``None`` only when the read genuinely failed (nonzero exit, or
+        output that is not ``history-limit <int>``). The caller then leaves
+        the option alone: a failed read is not a licence to overwrite whatever
+        a live server has.
+        """
+        try:
+            result = self.server.cmd("start-server", ";", "show-options", "-g", "history-limit")
+        except Exception:
+            logger.warning("failed to read tmux option 'history-limit'", exc_info=True)
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                "failed to read tmux option 'history-limit': %s",
+                "; ".join(result.stderr) or f"tmux exited {result.returncode}",
+            )
+            return None
+        for line in result.stdout or []:
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "history-limit":
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    break
+        logger.warning("unparseable tmux 'history-limit' output: %r", result.stdout)
+        return None
+
+    def _set_server_history_limit(self) -> None:
+        """Raise the shared tmux server's global ``history-limit`` to CAO's floor.
+
+        CAO does not run its own tmux server -- :meth:`__init__` opens a plain
+        ``libtmux.Server()``, i.e. the operator's default shared server (see
+        the module-level note on ``kill_session``) -- so this is a FLOOR: a
+        value already at or above ``TMUX_HISTORY_LIMIT`` is left untouched,
+        and a lower one (tmux's 2000 default, or an operator's own lower
+        setting) IS raised. The option is global, so the operator's own new
+        windows and sessions on that server get the floor too; panes that
+        already exist keep the scrollback they have. An operator who wants a
+        smaller floor sets ``CAO_TMUX_HISTORY_LIMIT`` (0 disables the raise);
+        ``docs/tmux.md`` has the cost (about 38 MB of tmux memory for a pane
+        that fills 50000 lines of 100 characters, allocated lazily as output
+        arrives). If the current value cannot be read, nothing is set: a
+        failed read on a live server must not become an overwrite.
+
+        Why a floor at all: tmux keeps 2000 scrollback lines per pane by
+        default -- shallower than the deepest rung of ``get_output``'s
+        extraction escalation (5000 lines). Measured on tmux 3.2a against a
+        pane that had printed 3000 lines: ``-S -1000`` returned 1023 lines,
+        while BOTH ``-S -5000`` and ``-S -`` returned 2004, and the first
+        ~1000 lines were simply gone. So on a default server the top of the
+        ladder cannot reach further than the middle of it, and a long reply
+        plus the full-screen redraw burst a TUI emits at the end of a turn can
+        push the response marker out of scrollback -- the supervisor then gets
+        a truncated reply or nothing, and the worker's pane is torn down right
+        after (#728).
+
+        Set before ``new_session``, and again from :meth:`create_window` and
+        :meth:`create_pane`: the session those run against may never have had
+        the floor raised (created before this fix, or by a different process),
+        and whether an existing pane picks up a raised global at all depends
+        on the tmux version: from 3.7 it does, for output that arrives
+        afterwards ("When history-limit is changed, apply to existing panes",
+        tmux CHANGES, issue 4705; measured on 3.4 and 3.8); before 3.7 it keeps
+        the limit it was created with. Either way, lines a pane has already
+        discarded at 2000 do not come back, so the raise has to be in place
+        before the pane produces output -- that is, before it is created.
+
+        Same ``start-server ; set-option`` single-invocation idiom as
+        :meth:`_set_server_exit_empty_off`, and for the same reason: on a clean
+        socket a bare ``set-option`` finds no server and lands nowhere. Kept as
+        a separate invocation from that one so neither option's failure can
+        swallow the other's. Retried once on a nonzero result for the same
+        reason documented there (a create right after an external
+        ``kill-server`` can reach the dying old server). Best-effort: a
+        shallower scrollback degrades extraction, it does not prevent a
+        launch.
+        """
+        current = self._read_server_history_limit()
+        if current is None:
+            # Already logged by the read. Leave a live server's value alone.
+            return
+        if current >= TMUX_HISTORY_LIMIT:
+            return
+
+        try:
+            result = self.server.cmd(
+                "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+            )
+            if result.returncode != 0:
+                time.sleep(self._EXIT_EMPTY_RETRY_DELAY_S)
+                result = self.server.cmd(
+                    "start-server",
+                    ";",
+                    "set-option",
+                    "-g",
+                    "history-limit",
+                    str(TMUX_HISTORY_LIMIT),
+                )
+        except Exception:
+            logger.warning("failed to set tmux option 'history-limit'", exc_info=True)
+            return
+
+        if result.returncode != 0:
+            logger.warning(
+                "failed to set tmux option 'history-limit %d': %s",
+                TMUX_HISTORY_LIMIT,
                 "; ".join(result.stderr) or f"tmux exited {result.returncode}",
             )
 
@@ -705,42 +1111,104 @@ class TmuxClient:
             logger.warning(f"Could not resolve a pane for {window_target}: {e}")
         return window_target
 
-    def attach_command(self, session_name: str, terminal_name: str) -> List[str]:
-        """Return the tmux argv that attaches to a session with a terminal focused.
+    def _locate_web_view_pane(
+        self, session_name: str, terminal_name: str
+    ) -> Optional[Tuple[str, str]]:
+        """``(window_id, pane_id)`` when the terminal lives as a pane, else None.
 
-        ``select-pane`` does not move the active window on its own, so a
-        terminal living as a pane needs its window selected first. tmux reads a
-        bare ``;`` argument as a command separator, so all three run on one
-        attach.
+        None means the terminal has a window of its own, or is not there at all
+        (the window target then makes tmux report it missing). A listing that
+        will not read raises ``TmuxLookupError``: the caller decides whether that
+        may degrade, because in pane mode "could not tell" must not become
+        "needs no pane selected".
         """
-        pane = None
+        session = self._find_session(session_name)
+        if session is None or self._find_window(session, session_name, terminal_name):
+            return None
+        pane = self._find_marked_pane(session, session_name, terminal_name)
+        if pane is None or not pane.pane_id or not pane.window.window_id:
+            return None
+        return pane.window.window_id, pane.pane_id
+
+    def web_view_attach_command(self, session_name: str, terminal_name: str) -> List[str]:
+        """``web_view_attach_argv`` for a terminal that may live as a pane.
+
+        A terminal without a window of its own is a marked pane, so the view
+        links the pane's window. A lookup that will not read falls back to the
+        window target, which tmux reports as missing in pane mode. The browser
+        path uses ``web_view_attach_plan`` instead, which also returns the pane.
+        """
         try:
-            session = self._find_session(session_name)
-            if session is not None and (
-                self._find_window(session, session_name, terminal_name) is None
-            ):
-                pane = self._find_marked_pane(session, session_name, terminal_name)
+            located = self._locate_web_view_pane(session_name, terminal_name)
         except TmuxLookupError:
-            pane = None
-        pane_id = pane.pane_id if pane is not None else None
-        window_id = pane.window.window_id if pane is not None else None
-        if pane_id is None or window_id is None:
-            return ["tmux", "-u", "attach-session", "-t", f"{session_name}:{terminal_name}"]
-        return [
-            "tmux",
-            "-u",
-            "attach-session",
-            "-t",
-            session_name,
-            ";",
-            "select-window",
-            "-t",
-            window_id,
-            ";",
-            "select-pane",
-            "-t",
-            pane_id,
-        ]
+            located = None
+        if located is None:
+            return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}")
+        return web_view_attach_argv(session_name, located[0])
+
+    def web_view_attach_plan(
+        self, session_name: str, terminal_name: str
+    ) -> Tuple[List[str], Optional[Tuple[str, str]]]:
+        """The view argv and the ``(window_id, pane_id)`` its input must select.
+
+        Both come from ONE lookup, so the pane the WebSocket handler selects is
+        always the pane whose window the view links; a second lookup could
+        disagree (the pane exits in between) and leave input unselected. The
+        focus is None only for a terminal with a window of its own, whose view
+        holds nothing else. Raises ``TmuxLookupError`` when tmux cannot be read.
+        """
+        located = self._locate_web_view_pane(session_name, terminal_name)
+        if located is None:
+            return web_view_attach_argv(session_name, f"{session_name}:{terminal_name}"), None
+        return web_view_attach_argv(session_name, located[0]), located
+
+    def escape_time_ms(self) -> Optional[int]:
+        """The server's ``escape-time`` in milliseconds, or None if unreadable."""
+        try:
+            result = self.server.cmd("show-options", "-sv", "escape-time")
+        except Exception as e:  # noqa: BLE001 — the caller has a safe default
+            logger.warning(f"Could not read tmux escape-time: {e}")
+            return None
+        if result.returncode != 0 or not result.stdout:
+            return None
+        value = str(result.stdout[0]).strip()
+        return int(value) if value.isdigit() else None
+
+    def select_pane(self, pane_id: str) -> None:
+        """Make ``pane_id`` the active pane of its window.
+
+        ``pane_id`` must be a tmux-issued ``%N`` id; anything else is refused
+        before it reaches tmux.
+        """
+        if not re.fullmatch(r"%\d+", pane_id or ""):
+            raise ValueError(f"not a tmux pane id: {pane_id!r}")
+        result = self.server.cmd("select-pane", "-t", pane_id)
+        if result.returncode != 0:
+            raise TmuxLookupError("; ".join(result.stderr) or f"select-pane {pane_id} failed")
+
+    def kill_web_views(self, session_name: str) -> None:
+        """Kill every browser view session showing a window of ``session_name``.
+
+        Best effort: a failure is logged, never raised, because session teardown
+        must still proceed. Views are matched on the owner option CAO set, not
+        on their name alone, so nothing CAO did not create is touched.
+        """
+        try:
+            result = self.server.cmd(
+                "list-sessions", "-F", f"#{{session_name}}|#{{{WEB_VIEW_OWNER_OPTION}}}"
+            )
+        except Exception as e:  # noqa: BLE001 — teardown must not fail on this
+            logger.warning(f"Could not list browser views of {session_name}: {e}")
+            return
+        if result.returncode != 0:
+            return
+        for line in result.stdout or []:
+            name, sep, owner = line.partition("|")
+            if sep and is_web_view_session(name) and owner == session_name:
+                try:
+                    self.server.cmd("kill-session", "-t", f"={name}")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Could not kill browser view {name}: {e}")
 
     @staticmethod
     def _kill_via_cli(session_name: str, window_name: Optional[str] = None) -> bool:
@@ -885,10 +1353,36 @@ class TmuxClient:
     # ``new-window -e`` argv under the kernel argv limit on busy hosts. The
     # number lives in utils/terminal_env, shared with the herdr backend.
     _MAX_ENV_VALUE_BYTES = MAX_ENV_VALUE_BYTES
+    # Forwarded to every new session whatever their prefix.
+    _ESSENTIAL_ENV_KEYS = frozenset(
+        {
+            "HOME",
+            "PATH",
+            "SHELL",
+            "USER",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "SSH_AUTH_SOCK",
+            "DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DO_NOT_TRACK",
+        }
+    )
 
     @classmethod
     def _is_blocked_env_key(cls, key: str) -> bool:
-        """Return True if ``key`` matches a blocked prefix and isn't allowlisted."""
+        """Return True if ``key`` must not reach the pane environment.
+
+        Two classes: provider prefixes (nested-session hazard, allowlist
+        applies) and the loader/shell/interpreter startup variables from
+        ``utils.forwarded_env`` (``LD_PRELOAD``, ``BASH_ENV``, ``NODE_OPTIONS``,
+        ...), whose value would run as the operator when the pane starts.
+        The second class has no allowlist.
+        """
+        if is_hijack_env_key(key):
+            return True
         if key in cls._BLOCKED_PREFIX_ALLOWLIST:
             return False
         return any(key.startswith(p) for p in cls._BLOCKED_ENV_PREFIXES)
@@ -907,7 +1401,7 @@ class TmuxClient:
             return
         for key, value in extra_env.items():
             if cls._is_blocked_env_key(key):
-                logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
+                logger.warning("Dropping forwarded env var with blocked key: %s", key)
                 continue
             if not within_value_cap("forwarded", key, value):
                 continue
@@ -942,6 +1436,30 @@ class TmuxClient:
             else:
                 session.unset_environment(key)
 
+    @classmethod
+    def _forwarded_server_env(cls) -> Dict[str, str]:
+        """The slice of this process's environment every new session is given.
+
+        Only essential env vars, to avoid tmux "command too long": the
+        essential keys, the provider allowlist, and unblocked ``CAO_``,
+        ``KIRO_``, ``MISE_`` and ``AWS_`` keys under the byte cap.
+        ``create_session`` forwards it, and ``restore_session_env`` puts a key
+        back from it, so the two cannot drift.
+        """
+        return {
+            k: v
+            for k, v in os.environ.items()
+            if (
+                k in cls._ESSENTIAL_ENV_KEYS
+                or k in cls._BLOCKED_PREFIX_ALLOWLIST
+                or (
+                    not cls._is_blocked_env_key(k)
+                    and k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
+                    and len(v.encode("utf-8")) < cls._MAX_ENV_VALUE_BYTES
+                )
+            )
+        }
+
     def create_session(
         self,
         session_name: str,
@@ -957,48 +1475,27 @@ class TmuxClient:
             # mass teardown (harness-control#845). Runs before new_session, and
             # starts the server if it isn't up yet.
             self._set_server_exit_empty_off()
+            # Deepen scrollback BEFORE new_session: the session's first pane is
+            # an agent terminal, and lines it discards at the 2000 default
+            # before the raise do not come back (#728).
+            self._set_server_history_limit()
 
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
-            # Only pass essential env vars to avoid tmux "command too long"
-            essential_keys = {
-                "HOME",
-                "PATH",
-                "SHELL",
-                "USER",
-                "LANG",
-                "LC_ALL",
-                "LC_CTYPE",
-                "TERM",
-                "SSH_AUTH_SOCK",
-                "DISPLAY",
-                "XDG_RUNTIME_DIR",
-                "DO_NOT_TRACK",
-            }
-            environment = {
-                k: v
-                for k, v in os.environ.items()
-                if (
-                    k in essential_keys
-                    or k in self._BLOCKED_PREFIX_ALLOWLIST
-                    or (
-                        not self._is_blocked_env_key(k)
-                        and k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
-                        and len(v.encode("utf-8")) < self._MAX_ENV_VALUE_BYTES
-                    )
-                )
-            }
+            environment = self._forwarded_server_env()
             # Operator-forwarded vars (from ``cao launch --env``) merge AFTER
             # the inherited slice and override on key collision, so an
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
+            environment["HISTFILE"] = "/dev/null"  # agent launch commands are noise
             # What the session environment may keep once the initial pane is
             # up. Profile env is for that pane only: see
             # _confine_profile_env_to_initial_pane.
             session_scoped_env = dict(environment)
             profile_keys = merge_profile_env(environment, trusted_env)
             apply_runtime_identity(environment, terminal_id, session_name)
+            environment["HISTFILE"] = "/dev/null"  # not even a profile turns history back on
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -1115,12 +1612,21 @@ class TmuxClient:
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
             try:
-                window_name_result = self._read_listing(
+                first_window = self._read_listing(
                     f"list-windows for new session '{session_name}'",
-                    lambda: session.windows[0].name,
+                    lambda: session.windows[0],
                 )
+                window_name_result = first_window.name
                 if window_name_result is None:
                     raise ValueError(f"Window name is None for session {session_name}")
+                # Stamp the owning terminal id on the window that owns this
+                # terminal. This is what exact-identity teardown matches on: the
+                # window NAME is reusable (a later terminal may take it), the id
+                # is not. Like the pane mark in create_pane(), identity is part
+                # of the creation contract, so a failure here takes the same
+                # rollback path as an unreadable window -- an unidentifiable
+                # terminal is one teardown can never safely prove ownership of.
+                first_window.set_option(TERMINAL_ID_OPTION, terminal_id)
             except TmuxLookupError:
                 # Same half-state, one step later: the session is up but we
                 # cannot confirm its window. Use the parse-free CLI here too —
@@ -1141,6 +1647,35 @@ class TmuxClient:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
 
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        """Give the session back the ``key`` it would have had without ``launch_value``.
+
+        ``new-session -e`` makes every ``create_session`` env entry session
+        state, which every later window in the session inherits. The session's
+        ``key`` is set back to what ``create_session`` forwards from this
+        process's own environment, or removed (``set-environment -u``) when it
+        forwards none. The first pane keeps the value it started with. Read
+        back to confirm.
+
+        Raises:
+            ValueError: The session is gone, this process would forward
+                ``launch_value`` itself, or tmux reports another value for ``key``.
+        """
+        expected = self._forwarded_server_env().get(key)
+        if expected == launch_value:
+            raise ValueError(f"this process's own {key} is the value private to the first window")
+        session = self._find_session(session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' not found")
+        if expected is None:
+            session.unset_environment(key)
+        else:
+            session.set_environment(key, expected)
+        if session.show_environment().get(key) != expected:
+            raise ValueError(
+                f"tmux reports a {key} for session '{session_name}' other than the forwarded one"
+            )
+
     def create_window(
         self,
         session_name: str,
@@ -1160,6 +1695,12 @@ class TmuxClient:
         for this terminal only (not persisted to the session).
         """
         try:
+            # The server's global history-limit may still be at tmux's 2000
+            # default if this session predates the fix for #728 (or was
+            # created by a different process entirely). Raise it before the
+            # window exists so none of its output is discarded at 2000.
+            self._set_server_history_limit()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             session = self._find_session(session_name)
@@ -1170,6 +1711,7 @@ class TmuxClient:
             self._merge_extra_env(window_env, extra_env)
             merge_profile_env(window_env, trusted_env)
             apply_runtime_identity(window_env, terminal_id, session_name)
+            window_env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             kwargs: dict = {
                 "window_name": window_name,
@@ -1180,6 +1722,9 @@ class TmuxClient:
                 kwargs["window_shell"] = window_shell
 
             window = session.new_window(**kwargs)
+            # See create_session(): the window carries its terminal id so
+            # teardown can prove ownership instead of trusting a reusable name.
+            window.set_option(TERMINAL_ID_OPTION, terminal_id)
 
             # See the matching comment in create_session(): the provider CLI
             # can rename its own window directly via `tmux rename-window`,
@@ -1228,7 +1773,44 @@ class TmuxClient:
         }
         if window_shell:
             kwargs["window_shell"] = window_shell
-        return session.new_window(**kwargs).panes[0]
+        window = session.new_window(**kwargs)
+        TmuxClient._caption_panes(window, host_window_name)
+        return window.panes[0]
+
+    @staticmethod
+    def _window_sets_own_border(window: Window) -> bool:
+        """Whether this window carries a border setting of its own.
+
+        Read the way ``_pane_mark`` reads a mark: through ``show-options``
+        without ``-A``, so tmux's default does not answer for the window, and
+        without libtmux's accessor, which raises for an option the window does
+        not set.
+        """
+        prefix = f"{BORDER_STATUS_OPTION} "
+        return any(
+            line.startswith(prefix) for line in window.cmd("show-options", "-w").stdout or []
+        )
+
+    @staticmethod
+    def _caption_panes(window: Window, host_window_name: str) -> None:
+        """Caption each pane with its mark, unless the window sets its own border.
+
+        Scoped to this window, and skipped for a window that already carries a
+        border setting: that leaves one somebody arranged by hand alone, and it
+        is also why a window CAO opened before captions existed gets them on
+        the next spawn into it rather than never — the window outlives
+        cao-server.
+
+        Captions are cosmetic. A tmux that refuses the options must not cost
+        the caller its terminal.
+        """
+        try:
+            if TmuxClient._window_sets_own_border(window):
+                return
+            window.set_option(BORDER_STATUS_OPTION, BORDER_STATUS_TOP)
+            window.set_option(BORDER_FORMAT_OPTION, BORDER_CAPTION_FORMAT)
+        except Exception as e:
+            logger.warning(f"Could not caption panes in window '{host_window_name}': {e}")
 
     @staticmethod
     def _split_host_window(
@@ -1296,6 +1878,10 @@ class TmuxClient:
                     f"Unknown pane layout '{pane_layout}'; expected one of "
                     f"{', '.join(sorted(PANE_LAYOUTS))}"
                 )
+            # See create_window(): a session that predates the fix for #728
+            # needs the floor raised before this pane exists as well.
+            self._set_server_history_limit()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             session = self._find_session(session_name)
@@ -1313,6 +1899,7 @@ class TmuxClient:
             self._merge_extra_env(pane_env, extra_env)
             merge_profile_env(pane_env, trusted_env)
             apply_runtime_identity(pane_env, terminal_id, session_name)
+            pane_env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
             host_window = self._find_window(session, session_name, host_window_name)
             if host_window is None:
@@ -1324,10 +1911,22 @@ class TmuxClient:
                     session, host_window_name, working_directory, window_shell, pane_env
                 )
             else:
-                pane = self._split_host_window(
-                    host_window, working_directory, window_shell, pane_env, pane_layout
-                )
+                try:
+                    pane = self._split_host_window(
+                        host_window, working_directory, window_shell, pane_env, pane_layout
+                    )
+                finally:
+                    # After the split is attempted, never before: a caption costs
+                    # a row per pane, and how many panes a window holds is what
+                    # decides whether this terminal fits or falls back to a window
+                    # of its own -- cosmetics must not move a terminal. After the
+                    # attempt that placement is already settled, so a full window
+                    # still gets captions for the panes it does hold.
+                    self._caption_panes(host_window, host_window_name)
             pane.set_option(TERMINAL_MARK_OPTION, terminal_name)
+            # The mark above carries the terminal NAME, which siblings and later
+            # terminals reuse. The id below is the identity teardown matches on.
+            pane.set_option(TERMINAL_ID_OPTION, terminal_id)
 
             logger.info(
                 f"Created pane '{terminal_name}' in window "
@@ -1670,6 +2269,7 @@ class TmuxClient:
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
         """Get window history.
 
@@ -1684,6 +2284,13 @@ class TmuxClient:
             full_history: If True, capture entire scrollback buffer (overrides tail_lines)
             visible_only: If True, capture exactly the currently rendered viewport
                 (``-S 0``) and nothing from scrollback (overrides tail_lines/full_history)
+            join_wrapped: If True, rows that tmux soft-wrapped at the pane width
+                come back rejoined into the logical line the program wrote
+                (``capture-pane -J``). A one-line message a CLI printed is one
+                row whatever the pane width, instead of N rows split at the
+                exact column -- often inside a word, as with codex's config
+                rejection at CAO's default 220 columns (#967). ``-J`` also keeps
+                trailing spaces, which the default capture trims.
 
         Raises:
             ValueError: The session or window is genuinely gone.
@@ -1714,6 +2321,8 @@ class TmuxClient:
             else:
                 lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
                 flags = ["-p", "-S", f"-{lines}"]
+            if join_wrapped:
+                flags = ["-J"] + flags
             if not strip_escapes:
                 flags = ["-e"] + flags
             result = pane.cmd("capture-pane", *flags)
@@ -1804,6 +2413,10 @@ class TmuxClient:
         through the parse-free tmux CLI instead — and then verified like any
         other, so the fallback cannot report an unconfirmed kill as success.
         """
+        _require_cao_session_name(session_name, "kill")
+        # A window still linked into a browser view survives kill-session, so
+        # the agent would keep running behind a "deleted" session. Views first.
+        self.kill_web_views(session_name)
         try:
             session = self._find_session(session_name)
             if session is None:
@@ -1865,6 +2478,7 @@ class TmuxClient:
         Like ``kill_session``, a listing parse failure falls back to the
         parse-free tmux CLI rather than reporting "nothing to kill".
         """
+        _require_cao_session_name(session_name, "kill a window in")
         try:
             session = self._find_session(session_name)
             if not session:
@@ -1889,6 +2503,224 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
+
+    # ── Exact-identity teardown ──────────────────────────────────────────
+    #
+    # `kill_window` above addresses its target by session/window NAME. Those
+    # names are reused: a retained deferred-init tombstone routinely shares its
+    # window name with a later, unrelated replacement, and killing "the window
+    # called X" would destroy that replacement. The methods below match on the
+    # terminal id stamped at creation instead, so teardown can answer "is THIS
+    # terminal still there?" rather than "is something called that there?".
+
+    @staticmethod
+    def _read_scoped_option(target: Union[Window, Pane], scope: str) -> Optional[str]:
+        """Read this target's own ``@cao_terminal_id`` (``-w``/``-p``), or None.
+
+        Read through ``show-options`` rather than the libtmux accessor, for the
+        same two reasons as ``_pane_mark``: that accessor RAISES for an object
+        carrying no value, and it hands back CONVERTED values, so a terminal id
+        that looks numeric (or like ``on``) stops matching itself. Without
+        ``-A`` we see only what this object sets itself, so its window's or the
+        session's value never answers for it.
+        """
+        prefix = f"{TERMINAL_ID_OPTION} "
+        result = target.cmd("show-options", scope)
+        if result.returncode != 0 or result.stderr:
+            raise TmuxLookupError("Could not read exact terminal identity from tmux options")
+        for line in result.stdout or []:
+            if line.startswith(prefix):
+                return str(line[len(prefix) :])
+        return None
+
+    def _sessions_for_identity_scan(self, session_name: Optional[str]) -> Optional[List[Session]]:
+        """Sessions to search for a terminal id, or None when the hint is absent.
+
+        ``None`` is the only "positively gone" answer here: it means the hinted
+        session does not exist, so no pane inside it can carry the id.
+
+        Raises:
+            TmuxLookupError: The session listing could not be parsed.
+        """
+        if session_name:
+            session = self._find_session(session_name)
+            return None if session is None else [session]
+        # Browser views link the agent's own window, so scanning them would find
+        # the same terminal id twice and refuse the cleanup as ambiguous.
+        return [
+            session
+            for session in self._read_listing("list-sessions", lambda: list(self.server.sessions))
+            if not is_web_view_session(session.name)
+        ]
+
+    def _scan_terminal_identity(
+        self,
+        sessions: List[Session],
+        terminal_id: str,
+        hint_window_name: Optional[str],
+    ) -> Tuple[List[Tuple[str, Union[Window, Pane]]], bool]:
+        """Find every tmux object in ``sessions`` carrying ``terminal_id``.
+
+        Returns ``(matches, ambiguous)`` where ``matches`` are ``(kind, object)``
+        pairs whose own ``@cao_terminal_id`` equals ``terminal_id``. More than
+        one match means the id is ambiguous and must not be acted on.
+
+        ``ambiguous`` is True when an object sits at the caller's
+        ``hint_window_name`` while carrying NO terminal id at all — either a
+        terminal created before the id was stamped, or a foreign object this
+        backend cannot attribute. Absence is only provable when neither case
+        holds, which is what keeps a pre-identity terminal from being reported
+        as gone and torn down as if it were.
+
+        Raises:
+            TmuxLookupError: A listing needed for the scan could not be parsed.
+        """
+        matches: List[Tuple[str, Union[Window, Pane]]] = []
+        ambiguous = False
+        for session in sessions:
+            windows = self._read_listing(
+                "list-windows for an identity scan",
+                lambda: list(session.windows),
+            )
+            for window in windows:
+                window_id = self._read_scoped_option(window, "-w")
+                if window_id == terminal_id:
+                    matches.append(("window", window))
+                elif window_id is None and hint_window_name and window.name == hint_window_name:
+                    ambiguous = True
+                panes = self._read_listing(
+                    "list-panes for an identity scan",
+                    lambda: list(window.panes),
+                )
+                for pane in panes:
+                    pane_id = self._read_scoped_option(pane, "-p")
+                    if pane_id == terminal_id:
+                        matches.append(("pane", pane))
+                    elif (
+                        pane_id is None
+                        and hint_window_name
+                        and self._pane_mark(pane) == hint_window_name
+                    ):
+                        ambiguous = True
+        return matches, ambiguous
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        """Close the exact tmux object owned by ``terminal_id`` and confirm it.
+
+        Identity comes from the ``@cao_terminal_id`` option stamped at creation,
+        never from the reusable session/window name, so a replacement that took
+        over the old terminal's name is never touched. ``session_name`` and
+        ``window_name`` only narrow the search and detect the pre-identity case.
+
+        ``ABSENT`` needs positive proof: either the hinted session is gone, or a
+        readable scan found no object carrying the id AND found nothing
+        unattributed sitting at the hint. ``UNKNOWN`` covers an unreadable
+        listing, an id that resolves to more than one live object, and a close
+        that could not be confirmed. ``DELETED`` is returned only after the
+        post-close scan confirms the id is gone.
+        """
+        if not terminal_id:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "no terminal id to prove identity with",
+            )
+
+        try:
+            sessions = self._sessions_for_identity_scan(session_name)
+        except TmuxLookupError as e:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not list tmux sessions: {e}",
+            )
+        except Exception as e:  # noqa: BLE001 — an unreadable scan is not absence
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not list tmux sessions: {e}",
+            )
+
+        if sessions is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.ABSENT,
+                f"session '{session_name}' is gone; no pane in it can carry {terminal_id}",
+            )
+
+        try:
+            matches, ambiguous = self._scan_terminal_identity(sessions, terminal_id, window_name)
+        except TmuxLookupError as e:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not read tmux identity for {terminal_id}: {e}",
+            )
+        except Exception as e:  # noqa: BLE001 — an unreadable scan is not absence
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not read tmux identity for {terminal_id}: {e}",
+            )
+
+        if len(matches) > 1:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"{len(matches)} tmux objects carry terminal id {terminal_id}; "
+                "refusing to close an ambiguous identity",
+            )
+        if matches:
+            kind, target = matches[0]
+            if not close:
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.STILL_PRESENT,
+                    f"{kind} carrying {terminal_id} is present; close not requested",
+                )
+            try:
+                self._read_listing(f"kill-{kind} for terminal {terminal_id}", target.kill)
+            except TmuxLookupError as e:
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.UNKNOWN,
+                    f"could not close the {kind} carrying {terminal_id}: {e}",
+                )
+            except Exception as e:  # noqa: BLE001 — a close that raised has not happened
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.STILL_PRESENT,
+                    f"closing the {kind} carrying {terminal_id} failed: {e}",
+                )
+            try:
+                after = self._sessions_for_identity_scan(session_name)
+                remaining: List[Tuple[str, Union[Window, Pane]]] = []
+                if after is not None:
+                    remaining, _ = self._scan_terminal_identity(after, terminal_id, None)
+            except Exception as e:  # noqa: BLE001 — closed, but unconfirmed is not DELETED
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.UNKNOWN,
+                    f"closed the {kind} carrying {terminal_id} but could not confirm "
+                    f"it is gone: {e}",
+                )
+            if remaining:
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.STILL_PRESENT,
+                    f"{kind} carrying {terminal_id} is still present after the close",
+                )
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.DELETED,
+                f"closed the exact {kind} carrying {terminal_id}",
+            )
+
+        if ambiguous:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"no tmux object carries terminal id {terminal_id}, but "
+                f"'{window_name}' is occupied by an object with no terminal id; "
+                "cannot prove absence",
+            )
+        return TerminalCleanupResult(
+            TerminalCleanupOutcome.ABSENT,
+            f"no tmux object carries terminal id {terminal_id}",
+        )
 
     def session_exists(self, session_name: str) -> bool:
         """Check if session exists.
@@ -2082,10 +2914,21 @@ class TmuxClient:
         """Get the current foreground command running in a pane.
 
         Returns None when it cannot be determined, including on a listing parse
-        failure. Its only caller
-        (``_pane_is_bracketed_paste_incompatible``) already treats None as
-        "assume a real TUI", the pre-existing safe default — so there is no
-        "gone" claim to get wrong here either.
+        failure. Callers treat None as "the provider still runs":
+        ``_pane_is_bracketed_paste_incompatible`` then assumes a real TUI, the
+        pre-existing safe default, and the exit checks of the codex, kiro_cli,
+        and omp providers find no shell. So there is no "gone" claim to get
+        wrong here either.
+
+        tmux names the foreground process of the pane's own tty. A shell
+        startup file can replace that process with a PTY proxy, which runs the
+        real shell on a second tty: the shell integration of Kiro CLI execs
+        ``zsh (kiro-cli-term)`` from ``~/.zshrc``. tmux then reports ``zsh``
+        for the life of the pane, whatever runs in it, and each caller reads
+        "the provider exited to a shell". ``send_keys`` then drops the
+        bracketed-paste wrap, so the TUI submits a multi-line message one line
+        at a time, and the Codex provider reports ERROR. So when tmux reports a
+        shell, look through a proxy to the program on the inner tty.
         """
         try:
             session = self._find_session(session_name)
@@ -2093,21 +2936,49 @@ class TmuxClient:
                 return None
             pane = self._resolve_pane(session, session_name, window_name)
             if pane:
-                result = pane.cmd("display-message", "-p", "#{pane_current_command}")
+                result = pane.cmd("display-message", "-p", "#{pane_current_command}\t#{pane_pid}")
                 if result.stdout:
-                    return result.stdout[0].strip()
+                    command, _, pane_pid = result.stdout[0].partition("\t")
+                    command = command.strip()
+                    pane_pid = pane_pid.strip()
+                    if command in BRACKETED_PASTE_INCOMPATIBLE_SHELLS and pane_pid.isdigit():
+                        return _command_inside_pty_proxy(int(pane_pid)) or command
+                    return command
             return None
         except Exception as e:
             logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")
             return None
 
+    @staticmethod
+    def _pipe_pane_command(file_path: str) -> str:
+        """The ``pipe-pane -o`` command: our FIFO writer, not ``cat >> path``.
+
+        ``cat >>`` opens the path with ``O_CREAT | O_APPEND`` and follows
+        symlinks, so a symlink or regular file swapped in at the FIFO path
+        received the pane's output. ``utils/fifo_writer.py`` opens with
+        ``O_NOFOLLOW``, confirms the descriptor is a FIFO, and only then copies
+        stdin into it. It is standard-library only, run by file path, and
+        started with ``-I -S`` (isolated mode, no ``site``): nothing from the
+        environment or a user site-packages is imported. tmux runs the command
+        through ``sh -c`` on the same host as the server; measured that way the
+        writer starts in ~37 ms against ~19 ms for ``cat``, about 15-20 ms more
+        per pipe-pane attach or liveness re-arm. The interpreter running
+        cao-server is the one to name, by absolute path; PATH does not matter.
+        """
+        interpreter = sys.executable or "python3"
+        return " ".join(
+            shlex.quote(part)
+            for part in (interpreter, "-I", "-S", fifo_writer.__file__, str(file_path))
+        )
+
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
-        """Start piping pane output to file.
+        """Start piping pane output to the FIFO at ``file_path``.
 
         Args:
             session_name: Tmux session name
             window_name: Tmux window name
-            file_path: Absolute path to log file
+            file_path: Absolute path to the FIFO (must already exist as a FIFO;
+                the writer refuses anything else at that path)
 
         Raises:
             ValueError: The session or window is genuinely gone.
@@ -2122,7 +2993,7 @@ class TmuxClient:
 
             pane = self._resolve_pane(session, session_name, window_name, required=True)
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {shlex.quote(str(file_path))}")
+                pane.cmd("pipe-pane", "-o", self._pipe_pane_command(file_path))
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")

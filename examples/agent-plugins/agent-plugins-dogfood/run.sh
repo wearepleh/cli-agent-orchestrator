@@ -38,8 +38,13 @@ LIVE_MODE="${CAO_DOGFOOD_LIVE:-0}"
 
 # THIS branch's code, not the installed cao (which predates the feature).
 CAO=(uv run --project "$REPO_ROOT" cao)
-# Plain python3 for JSON assertions — no CAO import, present on CI + macOS.
-PY="${CAO_DOGFOOD_PYTHON:-python3}"
+# Plain Python for the JSON assertions (no CAO import). Through uv, like CAO above, so
+# the job does not depend on a python3 on PATH. CAO_DOGFOOD_PYTHON overrides it.
+if [ -n "${CAO_DOGFOOD_PYTHON:-}" ]; then
+  PY=("$CAO_DOGFOOD_PYTHON")
+else
+  PY=(uv run --project "$REPO_ROOT" python)
+fi
 
 # ── isolation ───────────────────────────────────────────────────────────────
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cao-dogfood.XXXXXX")"
@@ -54,7 +59,7 @@ export CAO_AGENTS_DIR="$SCRATCH/kiro-agents"  # KIRO_AGENTS_DIR reads this env v
 # to execute without this — the CLI group errors out and the HTTP routes 404 —
 # because hiding a verb from `cao --help` was never an execution gate. A recorder
 # that drives the surface must open the gate explicitly, which also makes the GIF
-# an honest demonstration of how an operator reaches it before M1 lands.
+# an honest demonstration of how an operator reaches it before it graduates (#1244).
 export CAO_AGENT_PLUGINS_ENABLED=1
 KIRO_JSON="$CAO_AGENTS_DIR/dogfood-agent.json"
 OPTIN_JSON="$CAO_AGENTS_DIR/dogfood-optin.json"
@@ -93,7 +98,7 @@ hdr ""
 hdr "[1] cao plugin validate ./agent-plugin/cao"
 "${CAO[@]}" plugin validate "$REPO_ROOT/agent-plugin/cao" --json >"$CAP/validate.json" 2>"$CAP/validate.err" \
     || fail "validate exited non-zero"
-"$PY" - "$CAP/validate.json" <<'PY' >"$CAP/validate.summary" 2>&1 || fail "validate assertions failed (see below)$(cat "$CAP/validate.summary" 2>/dev/null)"
+"${PY[@]}" - "$CAP/validate.json" <<'PY' >"$CAP/validate.summary" 2>&1 || fail "validate assertions failed (see below)$(cat "$CAP/validate.summary" 2>/dev/null)"
 import json, sys
 r = json.load(open(sys.argv[1]))
 want = {"cao-agent-routing", "cao-session-management", "cao-supervisor-protocols", "cao-worker-protocols"}
@@ -148,7 +153,7 @@ hdr "[3] cao install dogfood-agent --provider kiro_cli    (R1 fix, end to end)"
 "${CAO[@]}" install "$SCRATCH/dogfood-agent.md" --provider kiro_cli >"$CAP/inst-kiro.out" 2>"$CAP/inst-kiro.err" \
     || fail "kiro install exited non-zero"
 [ -f "$KIRO_JSON" ] || fail "kiro agent JSON not written: $KIRO_JSON"
-PLUGIN_ROOT="$("$PY" - "$KIRO_JSON" <<'PY' 2>"$CAP/kiro.err" || true
+PLUGIN_ROOT="$("${PY[@]}" - "$KIRO_JSON" <<'PY' 2>"$CAP/kiro.err" || true
 import json, sys
 d = json.load(open(sys.argv[1]))
 res = d.get("resources", [])
@@ -179,7 +184,7 @@ PY
 # fail the recording, so this asserts the token is nowhere in the emitted file.
 ! grep -q '"@cao-ops"' "$KIRO_JSON" \
     || fail "@cao-ops appears in the emitted agent JSON for a profile that never named it (G0 auto-grant regression)"
-KIRO_ALLOWED="$("$PY" -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("allowedTools")))' "$KIRO_JSON")"
+KIRO_ALLOWED="$("${PY[@]}" -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("allowedTools")))' "$KIRO_JSON")"
 ok "resources: skill:// globs present"
 ok "mcpServers.cao-ops.env.PLUGIN_ROOT = $PLUGIN_ROOT"
 ok "PLUGIN_DATA present; the server is DELIVERED (configured, reachable by name)"
@@ -210,7 +215,7 @@ hdr "[3b] cao install dogfood-optin --provider kiro_cli    (escape hatch: opt in
 "${CAO[@]}" install "$SCRATCH/dogfood-optin.md" --provider kiro_cli \
     >"$CAP/inst-optin.out" 2>"$CAP/inst-optin.err" || fail "optin kiro install exited non-zero"
 [ -f "$OPTIN_JSON" ] || fail "optin agent JSON not written: $OPTIN_JSON"
-"$PY" - "$OPTIN_JSON" <<'PY' 2>"$CAP/optin.err" || fail "escape-hatch assertions failed: $(cat "$CAP/optin.err" 2>/dev/null)"
+"${PY[@]}" - "$OPTIN_JSON" <<'PY' 2>"$CAP/optin.err" || fail "escape-hatch assertions failed: $(cat "$CAP/optin.err" 2>/dev/null)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 mcp = d.get("mcpServers", {})
@@ -219,7 +224,7 @@ allowed = d.get("allowedTools", [])
 assert "@cao-ops" in allowed, f"@cao-ops NOT granted to a profile that named it: {allowed!r}"
 assert "x-cao-pre-expanded" not in json.dumps(d), "x-cao-pre-expanded marker leaked into provider config"
 PY
-OPTIN_ALLOWED="$("$PY" -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("allowedTools")))' "$OPTIN_JSON")"
+OPTIN_ALLOWED="$("${PY[@]}" -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("allowedTools")))' "$OPTIN_JSON")"
 ok "profile frontmatter declared: allowedTools: [\"@builtin\", fs_read, \"@cao-ops\"]"
 ok "allowedTools = $OPTIN_ALLOWED"
 ok "  -> @cao-ops GRANTED: the operator named it, so the grant honours that"
@@ -231,7 +236,7 @@ hdr "[4] cao install dogfood-agent --provider opencode_cli"
 "${CAO[@]}" install "$SCRATCH/dogfood-agent.md" --provider opencode_cli >"$CAP/inst-oc.out" 2>"$CAP/inst-oc.err" \
     || fail "opencode install exited non-zero"
 [ -f "$OPENCODE_JSON" ] || fail "opencode.json not written: $OPENCODE_JSON"
-"$PY" - "$OPENCODE_JSON" <<'PY' 2>"$CAP/oc.err" || fail "opencode enabled:true assertion failed: $(cat "$CAP/oc.err" 2>/dev/null)"
+"${PY[@]}" - "$OPENCODE_JSON" <<'PY' 2>"$CAP/oc.err" || fail "opencode enabled:true assertion failed: $(cat "$CAP/oc.err" 2>/dev/null)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 e = d["mcp"]["cao-ops"]["enabled"]
@@ -244,7 +249,7 @@ ok "opencode.json  mcp.cao-ops.enabled = true   (real JSON boolean)"
 # plugin (CAO_HOME_DIR unchanged); only OpenCode's config location moves.
 OC2_HOME="$SCRATCH/oc-collision-home"
 mkdir -p "$OC2_HOME/.aws/opencode"
-"$PY" - "$OC2_HOME/.aws/opencode/opencode.json" <<'PY'
+"${PY[@]}" - "$OC2_HOME/.aws/opencode/opencode.json" <<'PY'
 import json, sys
 json.dump({"$schema": "https://opencode.ai/config.json",
            "mcp": {"cao-ops": {"type": "local",
@@ -256,7 +261,7 @@ HOME="$OC2_HOME" "${CAO[@]}" install "$SCRATCH/dogfood-agent.md" --provider open
     >"$CAP/inst-oc2.out" 2>"$CAP/inst-oc2.err" || fail "opencode collision reinstall exited non-zero"
 grep -q "was not written to opencode.json" "$CAP/inst-oc2.err" \
     || fail "Finding 2 collision was not reported"
-"$PY" - "$OC2_HOME/.aws/opencode/opencode.json" <<'PY' 2>"$CAP/oc2.err" || fail "Finding 2: user entry NOT preserved: $(cat "$CAP/oc2.err" 2>/dev/null)"
+"${PY[@]}" - "$OC2_HOME/.aws/opencode/opencode.json" <<'PY' 2>"$CAP/oc2.err" || fail "Finding 2: user entry NOT preserved: $(cat "$CAP/oc2.err" 2>/dev/null)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 cmd = d["mcp"]["cao-ops"]["command"]
@@ -282,7 +287,7 @@ hdr "[5] cao plugin remove cao    (cross-provider removal, per handoff §2a)"
 # would have passed vacuously forever. What is worth pinning now is that removal
 # does not somehow ADD the token — and, on the opt-in profile, that removal does
 # NOT delete the operator's own declaration, because CAO did not write it.
-"$PY" - "$KIRO_JSON" <<'PY' 2>"$CAP/kiro5.err" || fail "Kiro removal assertion failed: $(cat "$CAP/kiro5.err" 2>/dev/null)"
+"${PY[@]}" - "$KIRO_JSON" <<'PY' 2>"$CAP/kiro5.err" || fail "Kiro removal assertion failed: $(cat "$CAP/kiro5.err" 2>/dev/null)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert "cao-ops" not in d.get("mcpServers", {}), "cao-ops still present in Kiro config after removal"
@@ -292,7 +297,7 @@ PY
 ok "Kiro:     cao-ops ABSENT from the rewritten agent JSON; @cao-ops still not granted"
 
 # The opt-in profile: the server is withdrawn, the operator's declaration is not.
-"$PY" - "$OPTIN_JSON" <<'PY' 2>"$CAP/optin5.err" || fail "opt-in removal assertion failed: $(cat "$CAP/optin5.err" 2>/dev/null)"
+"${PY[@]}" - "$OPTIN_JSON" <<'PY' 2>"$CAP/optin5.err" || fail "opt-in removal assertion failed: $(cat "$CAP/optin5.err" 2>/dev/null)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert "cao-ops" not in d.get("mcpServers", {}), "cao-ops still present in the opt-in Kiro config after removal"
@@ -306,7 +311,7 @@ ok "               (CAO withdraws what it configured, never what the operator wr
 
 # OpenCode: no delete exists, so removal sets enabled:false (offline substitute
 # — proves CAO's own write; the live step below proves the behaviour it buys).
-"$PY" - "$OPENCODE_JSON" <<'PY' 2>"$CAP/oc5.err" || fail "OpenCode removal assertion failed: $(cat "$CAP/oc5.err" 2>/dev/null)"
+"${PY[@]}" - "$OPENCODE_JSON" <<'PY' 2>"$CAP/oc5.err" || fail "OpenCode removal assertion failed: $(cat "$CAP/oc5.err" 2>/dev/null)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 e = d["mcp"]["cao-ops"]["enabled"]
@@ -363,6 +368,58 @@ else
     pass "removal is ABSENT on Kiro/Copilot, DISABLED on OpenCode (config-shape substitute)"
 fi
 
+# ── step 6: every other package CAO ships (#1154) ────────────────────────────
+# Steps 1-5 exercise `cao` in depth. This step runs validate, add and remove over
+# every OTHER package in scripts/build_agent_plugin.py's PACKAGES, so a package
+# added there is dog-fooded without editing this script. The allowlist is the
+# authority for which skills must load: reading the names back from the package
+# tree would only prove the tree agrees with itself. Output is one line per
+# package, because the recorder renders only the last 60 lines.
 hdr ""
-hdr "$MARK PASS: dog-food pipeline asserted end to end (validate, add, install x3, remove)."
+hdr "[6] validate, add, remove: every other package in PACKAGES"
+uv run --project "$REPO_ROOT" python - "$REPO_ROOT/scripts/build_agent_plugin.py" \
+    >"$CAP/packages.txt" 2>"$CAP/packages.err" <<'PY' || fail "could not read PACKAGES: $(cat "$CAP/packages.err")"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("build_agent_plugin", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod  # dataclasses resolve their module through sys.modules
+spec.loader.exec_module(mod)
+for package in mod.PACKAGES:
+    if package.name != "cao":
+        print(package.name, ",".join(package.skills))
+PY
+[ -s "$CAP/packages.txt" ] || fail "PACKAGES lists no package besides cao"
+while read -r pkg skills; do
+    dir="$REPO_ROOT/agent-plugin/$pkg"
+    "${CAO[@]}" </dev/null plugin validate "$dir" --json >"$CAP/v-$pkg.json" 2>"$CAP/v-$pkg.err" \
+        || fail "$pkg: validate exited non-zero"
+    "${PY[@]}" - "$CAP/v-$pkg.json" "$pkg" "$skills" <<'PY' 2>"$CAP/v-$pkg.chk" || fail "$pkg: validate assertions failed: $(cat "$CAP/v-$pkg.chk")"
+import json, sys
+r, name, want = json.load(open(sys.argv[1])), sys.argv[2], set(sys.argv[3].split(","))
+assert r.get("loadable") is True, f"loadable != true: {r.get('loadable')!r}"
+assert r.get("name") == name, f"manifest name is {r.get('name')!r}"
+got = {s["name"] for s in r.get("skills", [])}
+assert got == want, f"skills {sorted(got)} != allowlist {sorted(want)}"
+assert r.get("findings") == [], f"findings: {[f['code'] for f in r['findings']]}"
+PY
+    "${CAO[@]}" </dev/null plugin add "$dir" >"$CAP/a-$pkg.out" 2>"$CAP/a-$pkg.err" || fail "$pkg: plugin add exited non-zero"
+    for skill in ${skills//,/ }; do
+        link="$CAO_HOME_DIR/skills/$skill"
+        [ -L "$link" ] || fail "$pkg: $skill was not projected as a symlink"
+        case "$(readlink "$link")" in
+            */agent-plugins/"$pkg"/skills/"$skill") : ;;
+            *) fail "$pkg: $skill does not resolve into the plugin store" ;;
+        esac
+    done
+    "${CAO[@]}" </dev/null plugin remove "$pkg" --yes >"$CAP/r-$pkg.out" 2>"$CAP/r-$pkg.err" || fail "$pkg: plugin remove exited non-zero"
+    for skill in ${skills//,/ }; do
+        [ ! -e "$CAO_HOME_DIR/skills/$skill" ] && [ ! -L "$CAO_HOME_DIR/skills/$skill" ] \
+            || fail "$pkg: $skill is still projected after removal"
+    done
+    ok "$pkg: loadable, no findings, skills = allowlist (${skills//,/, }); added, then removed"
+done <"$CAP/packages.txt"
+pass "every package in PACKAGES validates clean, installs and removes"
+
+hdr ""
+hdr "$MARK PASS: dog-food pipeline asserted end to end (validate, add, install x3, remove; every package)."
 exit 0

@@ -73,8 +73,9 @@ from typing import Optional
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, OutputExtractionRejected
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -176,6 +177,16 @@ SEPARATOR_PATTERN = (
 # case-insensitive: a few builds render "plan" lower-case depending
 # on the locale.
 TUI_PLACEHOLDER_PATTERN = r"(?:Plan, search, build anything|Add a follow-up)"
+
+# Status-bar fragments, used only as a FALLBACK "the TUI has finished
+# rendering" guard when the input-box placeholder is not in the tail.
+# The bar renders the active model name, so it is plan- and
+# model-dependent and must never be the only readiness signal: a Cursor
+# Free plan cannot select a named model ("Free plans can only use Auto")
+# and renders "Auto" here, matching neither alternative. Gating
+# readiness on this pattern alone made every Free-plan launch time out
+# (issue #752). ``TUI_PLACEHOLDER_PATTERN`` is the model-independent
+# primary signal; see ``tui_rendered`` in get_status().
 TUI_STATUS_BAR_PATTERN = r"Run Everything|Composer \d"
 
 
@@ -199,6 +210,15 @@ class CursorCliProvider(BaseProvider):
         _agent_profile: Optional Cursor agent name (e.g. ``"developer"``).
         _model: Optional model override forwarded as ``--model``.
     """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return profile is None or not profile.model or profile.model == requested_model
 
     def __init__(
         self,
@@ -378,9 +398,9 @@ class CursorCliProvider(BaseProvider):
         # CAO so per-tool approval prompts do not block handoff /
         # assign flows. --trust was removed because v2026 rejects it
         # in interactive REPL mode ("only works with --print/headless
-        # mode"); the CAO launch flow already confirms workspace
-        # trust, and the interactive REPL has no per-directory trust
-        # dialog that --trust would skip.
+        # mode"). Newer interactive builds can still show their own
+        # workspace-trust dialog; --force does not answer it. The
+        # provider reports WAITING_USER_ANSWER for operator action.
         command_parts.append("--force")
 
         # Model override (--model, when explicitly set or supplied
@@ -461,7 +481,6 @@ class CursorCliProvider(BaseProvider):
             Absolute path to the file. Pass this to
             ``--system-prompt <path>``.
         """
-        import os
 
         prompt_path = self._cao_tmp_dir() / f"{self.terminal_id}-system-prompt.md"
         prompt_path.write_text(system_prompt, encoding="utf-8")
@@ -509,7 +528,7 @@ class CursorCliProvider(BaseProvider):
                 servers[server_name] = server_config.model_dump(exclude_none=True)
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation.
-            servers[server_name] = resolve_mcp_server_config(servers[server_name])
+            servers[server_name] = resolve_mcp_server_config(servers[server_name], name=server_name)
             env = servers[server_name].get("env", {})
             if "CAO_TERMINAL_ID" not in env:
                 env["CAO_TERMINAL_ID"] = self.terminal_id
@@ -602,6 +621,53 @@ class CursorCliProvider(BaseProvider):
         self._initialized = True
         return True
 
+    @staticmethod
+    def _has_new_workspace_trust_dialog(clean: str) -> bool:
+        """Recognise the measured trust action block, not quoted dialog text."""
+        # A newer composer ends this startup dialog. Limit only the new trust
+        # grammar this way: tool approvals can coexist with an older composer.
+        composers = list(
+            re.finditer(
+                r"(?m)^[ \t]*(?:[│|][ \t]*)?→[ \t]*" + TUI_PLACEHOLDER_PATTERN,
+                clean,
+                re.IGNORECASE,
+            )
+        )
+        if composers:
+            clean = clean[composers[-1].end() :]
+        rows = [line.strip().strip("│|").strip() for line in clean.splitlines()]
+        title = max(
+            (
+                i
+                for i, row in enumerate(rows)
+                if re.fullmatch(r"(?:⚠\ufe0f?\s*)?Workspace Trust Required", row, re.IGNORECASE)
+            ),
+            default=-1,
+        )
+        if title < 0:
+            return False
+        accept = next(
+            (
+                i
+                for i in range(title + 1, len(rows))
+                if re.fullmatch(
+                    r"(?:[▶❯>]\s*)?\[\s*a\s*\]\s+Trust this workspace", rows[i], re.IGNORECASE
+                )
+            ),
+            None,
+        )
+        if accept is None:
+            return False
+        # Joining only the question area tolerates line wrapping in a narrow
+        # pane while the title and the action choices remain structural rows.
+        question = " ".join(rows[title + 1 : accept])
+        return re.search(
+            r"Do you trust the contents of this directory\?", question, re.IGNORECASE
+        ) is not None and any(
+            re.fullmatch(r"(?:[▶❯>]\s*)?\[\s*q\s*\]\s+Quit", row, re.IGNORECASE)
+            for row in rows[accept + 1 :]
+        )
+
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         """Get Cursor CLI status by analyzing terminal output.
 
@@ -649,6 +715,13 @@ class CursorCliProvider(BaseProvider):
         # the raw stream.
         clean = strip_terminal_escapes(output)
 
+        # A resolved startup trust dialog can remain in scrollback above the
+        # version banner. Only discard that prefix: a later permission prompt
+        # must still block even when an old composer is visible below it.
+        banners = list(re.finditer(r"(?m)^[ \t]*Cursor Agent[ \t]*\n[ \t]*v\d{4}\.", clean))
+        if banners:
+            clean = clean[banners[-1].start() :]
+
         # =================================================================
         # v2026+ TUI detection — primary signal: "ctrl+c to stop".
         # =================================================================
@@ -681,10 +754,57 @@ class CursorCliProvider(BaseProvider):
         # present in the tail whenever the agent is working.
         TUI_TAIL_WINDOW = 1024
         tail = clean[-TUI_TAIL_WINDOW:]
-        processing_indicator_in_tail = (
-            re.search(TUI_PROCESSING_INDICATOR_PATTERN, tail, re.IGNORECASE) is not None
-        )
         placeholder_in_tail = re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
+
+        # The indicator is rendered ON the input-box line, next to the
+        # placeholder. Anchor the check to the tail starting at the LAST
+        # input-box line rather than searching the whole window: the
+        # pipe-pane buffer is an append-only stream of every TUI
+        # redraw, so a working frame's "ctrl+c to stop" is still
+        # sitting in the window after the agent finishes. A finished
+        # Cursor frame is only a few hundred bytes (input box, status
+        # bar, progress percentage), well inside TUI_TAIL_WINDOW, so a
+        # whole-window search keeps the terminal pinned at PROCESSING
+        # for the rest of the session (issue #752).
+        #
+        # The input-box line is matched STRUCTURALLY on Cursor's input
+        # arrow (``→``) immediately before the placeholder, not just on
+        # the placeholder phrase appearing anywhere in a line: ordinary
+        # response prose can contain "Add a follow-up" or "Plan,
+        # search, build anything" without the arrow, and matching that
+        # as the "last input-box line" would let response text
+        # impersonate the input box and report a still-working agent
+        # as COMPLETED.
+        #
+        # We search from the START of that last structural match to the
+        # END of the tail (not just that one line) because the
+        # indicator can wrap onto the line immediately after the
+        # placeholder in a narrow pane; the stale frame's indicator
+        # always sits BEFORE the final input-box line, never after it,
+        # since the finished frame is appended last.
+        #
+        # Builds that never render a placeholder (older text-mode
+        # Cursor) have no input-box line to anchor to; fall back to the
+        # whole-window search there so their behaviour is unchanged.
+        _input_box_line_re = re.compile(r"→\s*" + TUI_PLACEHOLDER_PATTERN, re.IGNORECASE)
+        _input_box_matches = list(_input_box_line_re.finditer(tail))
+        indicator_haystack = tail[_input_box_matches[-1].start() :] if _input_box_matches else tail
+        processing_indicator_in_tail = (
+            re.search(TUI_PROCESSING_INDICATOR_PATTERN, indicator_haystack, re.IGNORECASE)
+            is not None
+        )
+
+        # "The TUI has finished rendering" guard for the PROCESSING and
+        # IDLE/COMPLETED branches below. The status bar renders the
+        # ACTIVE MODEL NAME, so it cannot be the only readiness signal:
+        # on a Cursor Free plan a named model is rejected ("Free plans
+        # can only use Auto") and the bar reads "Auto", matching
+        # neither alternative in TUI_STATUS_BAR_PATTERN. That left
+        # get_status() at UNKNOWN forever and every launch timed out
+        # (issue #752). The placeholder is model-independent and is
+        # emitted by every v2026 TUI regardless of plan, so accept
+        # either marker.
+        tui_rendered = placeholder_in_tail or re.search(TUI_STATUS_BAR_PATTERN, clean) is not None
 
         if processing_indicator_in_tail:
             # Primary v2026+ PROCESSING signal: the "ctrl+c to stop"
@@ -742,9 +862,12 @@ class CursorCliProvider(BaseProvider):
         # Check for active TUI selection widgets (mode picker, model
         # picker, etc.) which show a ↑/↓ navigation footer. Exclude
         # the trust/permission dialogs, which are separate states.
+        trust_prompt = re.search(
+            TRUST_PROMPT_PATTERN, clean, re.IGNORECASE
+        ) is not None or self._has_new_workspace_trust_dialog(clean)
         if (
             re.search(WAITING_USER_ANSWER_PATTERN, clean)
-            and not re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE)
+            and not trust_prompt
             and not re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
@@ -752,16 +875,14 @@ class CursorCliProvider(BaseProvider):
         # Trust / permission dialogs are an interactive prompt that
         # blocks the agent until the operator accepts. Treat them as
         # WAITING_USER_ANSWER.
-        if re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE) or re.search(
-            PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE
-        ):
+        if trust_prompt or re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # v2026+ TUI: "ctrl+c to stop" is on the input-box line.
-        # This is the primary PROCESSING signal. We also require
-        # the status bar to be present so a half-initialised TUI
-        # does not false-positive.
-        if tui_processing and re.search(TUI_STATUS_BAR_PATTERN, clean):
+        # This is the primary PROCESSING signal. We also require the
+        # TUI to have finished rendering (``tui_rendered``) so a
+        # half-initialised TUI does not false-positive.
+        if tui_processing and tui_rendered:
             return TerminalStatus.PROCESSING
 
         # IDLE / COMPLETED: an idle prompt at the bottom of the
@@ -778,16 +899,15 @@ class CursorCliProvider(BaseProvider):
         if last_idle:
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
-        # v2026+ TUI IDLE: no "ctrl+c to stop" indicator on the
-        # input-box line AND the status bar is visible. The
+        # v2026+ TUI IDLE: no "ctrl+c to stop" indicator on the last
+        # input-box line AND the TUI has finished rendering. The
         # placeholder is always present in v2026 regardless of
         # state, so it is the *absence* of the processing
         # indicator that distinguishes idle / completed from
-        # processing. We require the status bar to be present
-        # too so we don't false-positive on a half-initialised
-        # TUI. Same IDLE-vs-COMPLETED split via the turn counter
-        # as above.
-        if not processing_indicator_in_tail and re.search(TUI_STATUS_BAR_PATTERN, clean):
+        # processing. We require ``tui_rendered`` too so we don't
+        # false-positive on a half-initialised TUI. Same
+        # IDLE-vs-COMPLETED split via the turn counter as above.
+        if not processing_indicator_in_tail and tui_rendered:
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN
@@ -831,6 +951,10 @@ class CursorCliProvider(BaseProvider):
         Raises:
             ValueError: When no response boundary is detected.
         """
+        panel_response = self._extract_panel_response(script_output)
+        if panel_response is not None:
+            return panel_response
+
         # Match a separator line, with ANY CSI sequence (not just
         # SGR) interleaved between the box-drawing characters.
         # Cursor re-renders the separator with new colour escapes
@@ -914,6 +1038,51 @@ class CursorCliProvider(BaseProvider):
         if not response:
             raise ValueError("Empty Cursor CLI response - no content found between separators")
 
+        return response
+
+    # A failed extraction must not publish echoed input or tool IO as an answer.
+    allow_raw_transcript_fallback = False
+
+    @staticmethod
+    def _extract_panel_response(script_output: str) -> Optional[str]:
+        """Read the coloured transcript/composer panels measured on 2026.10.22.
+
+        Keep SGR until boundaries are known: the text alone cannot distinguish
+        a submitted request from the assistant's reply. Unknown layouts fall
+        through to the existing separator grammar rather than guessing. These
+        RGB values are build/theme-specific; an unrecognised theme fails closed.
+        """
+        rows = script_output.splitlines()
+        user_panel = re.compile(r"^\s*\x1b\[(?:\d+;)*48;2;36;36;40(?:;\d+)*m")
+        input_panel = re.compile(r"^\s*\x1b\[(?:\d+;)*48;2;21;21;21(?:;\d+)*m")
+        user_rows = [i for i, row in enumerate(rows) if user_panel.match(row)]
+        if not user_rows:
+            return None
+        clean = [strip_terminal_escapes(row).rstrip() for row in rows]
+        composers = [
+            i
+            for i, row in enumerate(rows)
+            if input_panel.match(row)
+            and re.match(r"^\s*→\s*(?:Add a follow-up|Plan, search, build anything)", clean[i])
+        ]
+        if not composers or composers[-1] <= user_rows[-1]:
+            raise ValueError("Cursor response has no following composer boundary")
+        end = composers[-1]
+        # The stop hint can wrap below the composer in a narrow pane.
+        if re.search(TUI_PROCESSING_INDICATOR_PATTERN, "\n".join(clean[end:]), re.IGNORECASE):
+            raise OutputExtractionRejected("Cursor is still processing this turn")
+        while end > 0 and input_panel.match(rows[end - 1]):
+            end -= 1
+        start = user_rows[-1] + 1
+        # Compact tool badges have a dim grey glyph followed by a bold name.
+        tool_badge = re.compile(r"^\s*\x1b\[2m\x1b\[37m[^\x1b]*\x1b\[0m\s*\x1b\[1m")
+        response_rows = [clean[i] for i in range(start, end) if not tool_badge.match(rows[i])]
+        # Retain indentation beyond the two-space transcript gutter.
+        response = "\n".join(
+            row[2:] if row.startswith("  ") else row for row in response_rows
+        ).strip()
+        if not response:
+            raise OutputExtractionRejected("Cursor has not produced a final answer for this turn")
         return response
 
     def exit_cli(self) -> str:

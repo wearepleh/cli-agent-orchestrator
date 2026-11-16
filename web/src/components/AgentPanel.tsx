@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import { api, AgentProfileInfo, ProviderInfo } from '../api'
 import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Tag, Search, Mail, Plus, LogOut, Send, FileText, X } from 'lucide-react'
+import { PromptPresets } from './PromptPresets'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -9,6 +10,7 @@ import { CustomSelect, SelectOption } from './CustomSelect'
 import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { AgentDescription } from './AgentDescription'
 
 export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli', 'grok_cli']
 
@@ -63,6 +65,29 @@ export function AgentPanel() {
   const [sendingInput, setSendingInput] = useState<string | null>(null)
   const { showSnackbar } = useStore()
   const [outputTerminalId, setOutputTerminalId] = useState<string | null>(null)
+  // "Shut down all sessions" (the `cao shutdown --all` equivalent): one confirm,
+  // then each session is deleted in turn and a single summary is shown.
+  const [confirmShutdownAll, setConfirmShutdownAll] = useState(false)
+  const [shuttingDownAll, setShuttingDownAll] = useState(false)
+  const handleShutdownAll = async () => {
+    setShuttingDownAll(true)
+    const failed: string[] = []
+    for (const s of sessions) {
+      try {
+        await api.deleteSession(s.name)
+      } catch {
+        failed.push(s.name)
+      }
+    }
+    if (activeSession && !failed.includes(activeSession)) selectSession(null)
+    await fetchSessions()
+    setShuttingDownAll(false)
+    setConfirmShutdownAll(false)
+    const done = sessions.length - failed.length
+    showSnackbar(failed.length
+      ? { type: 'error', message: `Shut down ${done} session(s); failed: ${failed.join(', ')} (retry after cleanup finishes)` }
+      : { type: 'success', message: `Shut down ${done} session(s)` })
+  }
   const [showSpawnModal, setShowSpawnModal] = useState(false)
 
   const handleDeleteTerminal = async () => {
@@ -216,9 +241,18 @@ export function AgentPanel() {
                   value={sessionSearch}
                   onChange={e => setSessionSearch(e.target.value)}
                   placeholder="Filter sessions..."
-                  className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg pl-8 pr-3 py-1.5 w-48 focus:border-emerald-500 focus:outline-none"
+                  className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg pl-8 pr-3 py-1.5 w-48 focus:border-emerald-500 focus:outline-hidden"
                 />
               </div>
+            )}
+            {sessions.length > 0 && (
+              <button
+                onClick={() => setConfirmShutdownAll(true)}
+                className="flex items-center gap-2 border border-red-800/70 text-red-300 hover:bg-red-900/30 text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+              >
+                <Trash2 size={14} />
+                Shut down all
+              </button>
             )}
             <button
               onClick={() => setShowSpawnModal(true)}
@@ -254,7 +288,7 @@ export function AgentPanel() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={e => { e.stopPropagation(); deleteSession(s.id) }}
-                    className="p-1.5 text-gray-500 hover:text-red-400 transition-colors rounded"
+                    className="p-1.5 text-gray-500 hover:text-red-400 transition-colors rounded-sm"
                     title="Delete session"
                   >
                     <Trash2 size={14} />
@@ -325,7 +359,7 @@ export function AgentPanel() {
                       value={addProfile}
                       onChange={e => setAddProfile(e.target.value)}
                       placeholder="e.g. developer, reviewer"
-                      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none"
+                      className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-hidden"
                     />
                   )}
                 </div>
@@ -348,7 +382,7 @@ export function AgentPanel() {
                     onChange={e => setAddWorkDir(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && handleAddAgent()}
                     placeholder="/path/to/project (optional)"
-                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg pl-9 pr-3 py-2 focus:border-emerald-500 focus:outline-none"
+                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg pl-9 pr-3 py-2 focus:border-emerald-500 focus:outline-hidden"
                   />
                 </div>
               </div>
@@ -358,7 +392,7 @@ export function AgentPanel() {
           <div className="space-y-2">
             {activeSessionDetail.terminals.map(t => (
               <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg p-3 space-y-2">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between mb-0.5">
                   <div className="flex items-center gap-3">
                     <TermIcon size={14} className="text-gray-400" />
                     <span className="text-sm font-mono text-gray-300">{t.id}</span>
@@ -369,11 +403,17 @@ export function AgentPanel() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setInboxTerminalId(t.id)}
-                      className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors"
+                      className="relative flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors"
                       title="View inbox"
+                      aria-label={(t.pending_inbox_count ?? 0) > 1 ? `Inbox: ${t.pending_inbox_count} pending messages` : 'Inbox'}
                     >
                       <Mail size={14} />
                       Inbox
+                      {(t.pending_inbox_count ?? 0) > 1 && (
+                        <span aria-hidden="true" className="pointer-events-none absolute -top-2.5 -right-1 flex h-4 min-w-4 items-center justify-center whitespace-nowrap rounded-full bg-red-600 px-1 text-[10px] font-semibold leading-none text-white">
+                          {t.pending_inbox_count}
+                        </span>
+                      )}
                     </button>
                     <button
                       onClick={() => openTerminal(t.id, t.provider, t.agent_profile)}
@@ -411,6 +451,14 @@ export function AgentPanel() {
                     </button>
                   </div>
                 </div>
+                <AgentDescription className="mt-0.5!" id={t.id} description={t.description} onSaved={description => {
+                  useStore.setState(state => ({ activeSessionDetail: state.activeSessionDetail ? {
+                    ...state.activeSessionDetail,
+                    terminals: state.activeSessionDetail.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                  } : null }))
+                  const selectedSession = useStore.getState().activeSession
+                  if (selectedSession) void selectSession(selectedSession)
+                }} />
                 {/* Working Directory Display */}
                 {terminalWorkDirs[t.id] && (
                   <div className="flex items-center gap-1.5" title={terminalWorkDirs[t.id]!}>
@@ -434,8 +482,12 @@ export function AgentPanel() {
                       onChange={e => setSendInputValues(prev => ({ ...prev, [t.id]: e.target.value }))}
                       onKeyDown={e => { if (e.key === 'Enter') handleSendInput(t.id) }}
                       placeholder="Type a message..."
-                      className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg px-3 py-1.5 focus:border-emerald-500 focus:outline-none"
+                      className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg px-3 py-1.5 focus:border-emerald-500 focus:outline-hidden"
                       autoFocus
+                    />
+                    <PromptPresets
+                      current={sendInputValues[t.id] || ''}
+                      onInsert={text => setSendInputValues(prev => ({ ...prev, [t.id]: text }))}
                     />
                     <button
                       onClick={() => handleSendInput(t.id)}
@@ -494,6 +546,19 @@ export function AgentPanel() {
         onCancel={() => setPendingClose(null)}
       />
 
+      {/* Shut Down All Sessions Confirmation Modal */}
+      <ConfirmModal
+        open={confirmShutdownAll}
+        title="Shut down all sessions"
+        message="This closes every agent terminal in every session and deletes the sessions. This action cannot be undone."
+        details={[{ label: 'Sessions', value: sessions.map(s => s.name).join(', ') || 'none' }]}
+        confirmLabel="Shut down all"
+        variant="danger"
+        loading={shuttingDownAll}
+        onConfirm={handleShutdownAll}
+        onCancel={() => setConfirmShutdownAll(false)}
+      />
+
       {/* Graceful Exit Confirmation Modal */}
       <ConfirmModal
         open={!!pendingExit}
@@ -515,14 +580,14 @@ export function AgentPanel() {
       {/* Spawn Agent Modal */}
       {showSpawnModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setShowSpawnModal(false)} />
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={() => setShowSpawnModal(false)} />
           <div className="relative bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl shadow-black/50 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
             {/* Modal header */}
             <div className="flex items-center justify-between p-5 border-b border-gray-700/50">
               <div>
                 <h3 className="text-base font-semibold text-gray-200">Spawn Agent</h3>
                 <p className="text-xs text-gray-500 mt-1">
-                  Launch a new AI agent in its own isolated tmux session.
+                  Launch a new AI agent in its own isolated terminal session.
                 </p>
               </div>
               <button
@@ -572,7 +637,7 @@ export function AgentPanel() {
                     value={profile}
                     onChange={e => setProfile(e.target.value)}
                     placeholder="e.g. developer, reviewer"
-                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none"
+                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-hidden"
                   />
                 )}
               </div>
@@ -587,7 +652,7 @@ export function AgentPanel() {
                     onChange={e => setSessionName(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && handleCreate()}
                     placeholder="my-session (or a random id like cao-a1b2c3d4)"
-                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg pl-9 pr-3 py-2.5 focus:border-emerald-500 focus:outline-none"
+                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg pl-9 pr-3 py-2.5 focus:border-emerald-500 focus:outline-hidden"
                   />
                 </div>
               </div>
@@ -602,7 +667,7 @@ export function AgentPanel() {
                     onChange={e => setWorkingDirectory(e.target.value)}
                     onKeyDown={e => e.key === 'Enter' && handleCreate()}
                     placeholder="/path/to/project (defaults to home)"
-                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg pl-9 pr-3 py-2.5 focus:border-emerald-500 focus:outline-none"
+                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg pl-9 pr-3 py-2.5 focus:border-emerald-500 focus:outline-hidden"
                   />
                 </div>
               </div>

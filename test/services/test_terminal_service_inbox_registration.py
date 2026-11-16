@@ -28,6 +28,8 @@ from cli_agent_orchestrator.services.terminal_service import (
     delete_terminal,
 )
 
+pytestmark = pytest.mark.usefixtures("kiro_agent_store_not_under_test")
+
 # Fixed identifiers used across the tests so assertions can be exact.
 TERMINAL_ID = "term-abc123"
 SESSION_NAME = "cao-test-session"
@@ -67,7 +69,7 @@ def create_mocks():
             generate_terminal_id=p("generate_terminal_id"),
             generate_session_name=p("generate_session_name"),
             generate_window_name=p("generate_window_name"),
-            load_agent_profile=p("load_agent_profile"),
+            load_agent_profile=p("agent_profiles.load_agent_profile"),
             build_skill_catalog=p("build_skill_catalog"),
             dispatch_plugin_event=p("dispatch_plugin_event"),
             update_terminal_shell_command=p("update_terminal_shell_command"),
@@ -91,6 +93,7 @@ def create_mocks():
         # create_terminal awaits provider.initialize(); make it a coroutine.
         provider_instance = m.provider_manager.create_provider.return_value
         provider_instance.initialize = AsyncMock(return_value=True)
+        provider_instance.identity_verified = True  # a healthy Kiro launch (#1074)
 
         service = MagicMock()
         m.get_herdr_inbox_service.return_value = service
@@ -223,7 +226,7 @@ class TestDeleteTerminalHerdrUnregistration:
         m = delete_mocks
 
         # Act
-        result = delete_terminal(TERMINAL_ID)
+        result = delete_terminal(TERMINAL_ID, end_reason="deleted")
 
         # Assert
         m.service.unregister_terminal.assert_called_once_with(TERMINAL_ID)
@@ -240,7 +243,7 @@ class TestDeleteTerminalHerdrUnregistration:
         m.get_herdr_inbox_service.return_value = None
 
         # Act
-        result = delete_terminal(TERMINAL_ID)
+        result = delete_terminal(TERMINAL_ID, end_reason="deleted")
 
         # Assert
         m.service.unregister_terminal.assert_not_called()

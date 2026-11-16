@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError
 from cli_agent_orchestrator.agent_plugins.validation import validate_plugin
 
 from .conftest import build_plugin
@@ -56,6 +55,7 @@ class TestPerSkillFailureIsolationAtTheFileLevel:
         assert report.skill_names == ("alpha",)
 
 
+@pytest.mark.usefixtures("allow_local_git_sources")
 class TestCommitPinnedCloneClearsStaging:
     def test_a_pinned_fetch_starts_from_an_empty_staging_tree(self, tmp_path, monkeypatch):
         """`init` + `fetch` cannot run over a partial tree from a failed attempt.

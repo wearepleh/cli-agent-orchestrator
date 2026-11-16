@@ -1,12 +1,15 @@
 """Tests for the `cao config` CLI command group (issue #357)."""
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.config import _coerce, config
 from cli_agent_orchestrator.services import config_service as cs
+from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.utils.atomic_file import LockTimeoutError
 
 
 @pytest.fixture(autouse=True)
@@ -124,6 +127,25 @@ class TestConfigSet:
         assert result.exception is None or isinstance(result.exception, SystemExit)
         assert "Unknown memory setting" in result.output
 
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            LockTimeoutError(Path("settings.lock"), 0.01),
+            OSError("settings.json is read-only"),
+        ],
+    )
+    def test_set_write_failure_is_a_clean_cli_error(
+        self, runner, _isolated_settings, monkeypatch, failure
+    ):
+        monkeypatch.setattr(ConfigService, "set", lambda key, value: (_ for _ in ()).throw(failure))
+
+        result = runner.invoke(config, ["set", "workflow.require_approval", "false"])
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "could not save configuration" in result.output
+        assert str(failure) in result.output
+
     def test_set_memory_lint_enabled_false_persists_locally(self, runner, _isolated_settings):
         result = runner.invoke(config, ["set", "memory.lint_enabled", "false"])
         assert result.exit_code == 0
@@ -135,6 +157,26 @@ class TestConfigSet:
         get_result = runner.invoke(config, ["get", "memory.lint_enabled"])
         assert get_result.exit_code == 0
         assert json.loads(get_result.output) is False
+
+    def test_set_memory_ranking_default_sort_round_trips(self, runner, _isolated_settings):
+        result = runner.invoke(config, ["set", "memory.ranking.default_sort", "bm25"])
+        assert result.exit_code == 0
+
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["memory"]["ranking"]["default_sort"] == "bm25"
+
+        get_result = runner.invoke(config, ["get", "memory.ranking.default_sort"])
+        assert get_result.exit_code == 0
+        assert json.loads(get_result.output) == "bm25"
+        assert ConfigService.get_config().memory.ranking.default_sort == "bm25"
+
+    def test_set_invalid_memory_ranking_default_sort_errors(self, runner, _isolated_settings):
+        result = runner.invoke(config, ["set", "memory.ranking.default_sort", "score"])
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "ranking.default_sort must be one of" in result.output
+        assert not _isolated_settings["settings"].exists()
 
     def test_set_network_key_succeeds_persists_and_warns(self, runner, _isolated_settings):
         """network.* is schema-only (no runtime effect yet) — set() still

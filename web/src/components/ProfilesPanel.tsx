@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, AgentProfileInfo, AgentProfileDetail, ProfileSearchResult, ProfileValidationMessage } from '../api'
-import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, Tag, Trash2, Wrench, Loader2 } from 'lucide-react'
+import { Package, Plus, Search, AlertTriangle, Copy, CopyPlus, FilePen, SlidersHorizontal, Tag, Trash2, Wrench, Loader2, Download } from 'lucide-react'
 import { ProfileCreateModal } from './ProfileCreateModal'
 import { ProfileEditorModal } from './ProfileEditorModal'
 import { ConfirmModal } from './ConfirmModal'
+import { readDeclaredParams } from './workflow/workflowYaml'
 import { useStore } from '../store'
 import { useGeneration } from '../hooks/useGeneration'
 
@@ -36,7 +37,7 @@ function sourceBadgeClass(source: string): string {
 
 function SourceBadge({ source }: { source: string }) {
   return (
-    <span className={`px-1.5 py-0.5 text-[10px] font-medium rounded border ${sourceBadgeClass(source)}`}>
+    <span className={`px-1.5 py-0.5 text-[10px] font-medium rounded-sm border ${sourceBadgeClass(source)}`}>
       {source}
     </span>
   )
@@ -67,6 +68,48 @@ function DetailField({ label, value }: { label: string; value: string | undefine
     <div>
       <div className="text-xs text-gray-500 uppercase tracking-wide mb-0.5">{label}</div>
       <div className="text-sm text-gray-200 font-mono">{value}</div>
+    </div>
+  )
+}
+
+/**
+ * The params the profile declares, in declaration order: the params a workflow
+ * step that uses it must fill. readDeclaredParams reads the untrusted
+ * declaration with every size bounded.
+ */
+function ParamsList({ params, editable }: { params: AgentProfileDetail['params']; editable: boolean }) {
+  const declared = readDeclaredParams(params)
+  return (
+    <div data-testid="profile-params">
+      <div className="flex items-center gap-1.5 text-xs text-gray-500 uppercase tracking-wide mb-1.5">
+        <SlidersHorizontal size={12} />
+        Params
+      </div>
+      {declared.length === 0 ? (
+        <p className="text-sm text-gray-500">
+          {editable
+            ? 'This profile declares no params. Edit it to add some.'
+            : 'This profile declares no params. Clone it to add some.'}
+        </p>
+      ) : (
+        <ul aria-label="Params" className="space-y-1.5">
+          {declared.map(p => (
+            <li key={p.name} data-testid="profile-param" data-name={p.name} className="text-sm">
+              <div className="flex flex-wrap items-baseline gap-x-2">
+                <span className="font-mono text-gray-200">
+                  {p.name}
+                  {p.required && <span aria-hidden="true" className="ml-0.5 text-red-400">*</span>}
+                  {p.required && <span className="sr-only"> (required)</span>}
+                </span>
+                <span className="text-xs text-gray-500">{p.type}</span>
+                {p.default !== null && <span className="text-xs text-gray-400">default: <span className="font-mono">{p.default}</span></span>}
+                {p.enum && <span className="text-xs text-gray-400">allowed: <span className="font-mono">{p.enum.join(', ')}</span></span>}
+              </div>
+              {p.description && <div className="text-xs text-gray-500">{p.description}</div>}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }
@@ -193,6 +236,7 @@ function ProfileDetail({
           </div>
           <ChipList label="Tags" icon={<Tag size={12} />} items={detail.tags ?? []} />
           <ChipList label="Capabilities" icon={<Wrench size={12} />} items={detail.capabilities ?? []} />
+          <ParamsList params={detail.params} editable={row.source === 'local'} />
         </>
       )}
     </div>
@@ -215,6 +259,11 @@ export function ProfilesPanel() {
 
   const [selected, setSelected] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
+  // Install a profile by name or https:// URL (POST /agents/profiles/install) —
+  // the `cao install` equivalent, without leaving the UI.
+  const [installOpen, setInstallOpen] = useState(false)
+  const [installName, setInstallName] = useState('')
+  const [installing, setInstalling] = useState(false)
   const [editor, setEditor] = useState<{ mode: 'edit' | 'clone'; name: string } | null>(null)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -268,6 +317,41 @@ export function ProfilesPanel() {
     setResults(null)
     setSearchError(null)
     setSearching(false)
+  }
+
+  // Deployment-supplied one-click installs (ui-presets.json), shown as chips in
+  // the Install row — e.g. a team's shared profiles by https:// URL, since the
+  // server installs names and URLs but not local file paths.
+  const [quickInstalls, setQuickInstalls] = useState<{ label: string; source: string; provider?: string }[]>([])
+  useEffect(() => {
+    if (!installOpen) return
+    let cancelled = false
+    api.getUiPresets().then(p => { if (!cancelled) setQuickInstalls(p.installs ?? []) })
+    return () => { cancelled = true }
+  }, [installOpen])
+
+  const handleInstall = async (preset?: { source: string; provider?: string }) => {
+    const source = preset ? preset.source : installName.trim()
+    if (!source || installing) return
+    setInstalling(true)
+    try {
+      const res = await api.installProfile(source, preset?.provider)
+      if (res.success) {
+        showSnackbar({ type: 'success', message: res.message || `Installed '${source}'` })
+        // Keep the row open after a chip so a set (e.g. three profiles) is three clicks.
+        if (!preset) {
+          setInstallOpen(false)
+          setInstallName('')
+        }
+        await refreshCatalog()
+      } else {
+        showSnackbar({ type: 'error', message: res.message || `Failed to install '${source}'` })
+      }
+    } catch (e: any) {
+      showSnackbar({ type: 'error', message: e?.detail || e?.message || `Failed to install '${source}'` })
+    } finally {
+      setInstalling(false)
+    }
   }
 
   useEffect(() => { refreshCatalog() }, [])
@@ -404,13 +488,62 @@ export function ProfilesPanel() {
             {results !== null ? `${results.length} match${results.length !== 1 ? 'es' : ''}` : `${catalog.length} profile${catalog.length !== 1 ? 's' : ''}`}
           </span>
         </div>
-        <button
-          onClick={() => setCreateOpen(true)}
-          className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium px-3 py-2 rounded-lg transition-colors"
-        >
-          <Plus size={14} /> New profile
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setInstallOpen(o => !o)}
+            aria-expanded={installOpen}
+            className="flex items-center gap-2 border border-gray-700 hover:bg-gray-800 text-gray-200 text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+          >
+            <Download size={14} /> Install
+          </button>
+          <button
+            onClick={() => setCreateOpen(true)}
+            className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium px-3 py-2 rounded-lg transition-colors"
+          >
+            <Plus size={14} /> New profile
+          </button>
+        </div>
       </div>
+
+      {installOpen && quickInstalls.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          {quickInstalls.map(q => (
+            <button
+              key={q.label}
+              type="button"
+              onClick={() => handleInstall(q)}
+              disabled={installing}
+              title={q.source}
+              className="flex items-center gap-1.5 rounded-lg border border-emerald-800/60 px-2.5 py-1 text-xs text-emerald-200 hover:bg-emerald-900/30 disabled:opacity-40"
+            >
+              <Download size={12} aria-hidden="true" /> {q.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {installOpen && (
+        <div className="mb-4 flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/40 p-3">
+          <input
+            type="text"
+            value={installName}
+            onChange={e => setInstallName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleInstall() }}
+            placeholder="Profile name to install (e.g. reviewer)"
+            aria-label="Profile name to install"
+            className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-1.5 focus:border-emerald-500 focus:outline-none"
+            autoFocus
+          />
+          <button
+            onClick={() => handleInstall()}
+            disabled={installing || !installName.trim()}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-colors"
+          >
+            {installing ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+            {installing ? 'Installing…' : 'Install'}
+          </button>
+        </div>
+      )}
 
       {/* Search */}
       <div className="relative max-w-md">
@@ -422,7 +555,7 @@ export function ProfilesPanel() {
           placeholder="Search by capability, e.g. 'monitor sqs'…"
           value={query}
           onChange={e => { navGen.invalidate(); setQuery(e.target.value) }}
-          className="w-full pl-9 pr-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600"
+          className="w-full pl-9 pr-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600"
         />
         {searching && <Loader2 size={14} className="animate-spin absolute right-3 top-1/2 -translate-y-1/2 text-gray-500" data-testid="search-spinner" />}
       </div>

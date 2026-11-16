@@ -12,12 +12,14 @@ no-secret-leak), and the reserved seams raising ``NotBuiltYetError``.
 from __future__ import annotations
 
 from typing import List
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import (
+    InputDecl,
     NotBuiltYetError,
     RunState,
     StepState,
@@ -153,7 +155,7 @@ async def test_workflow_step_forwards_explicit_engine(monkeypatch):
 
     await ws.start_run(spec, {}, "engine-run")
 
-    assert mock.await_args.kwargs["engine"] == "kas"
+    assert mock.await_args.kwargs["engine"] is KiroEngine.V3
 
 
 @pytest.mark.asyncio
@@ -173,6 +175,8 @@ async def test_trace_b_worker_crashes_twice_then_succeeds(monkeypatch):
     assert res.state == RunState.COMPLETED
     assert res.steps[0].state == StepState.COMPLETED
     assert res.steps[0].attempts == 3
+    # The attempt-1 failure kind is cleared when a retry settles successfully.
+    assert res.steps[0].error_kind is None
 
 
 @pytest.mark.asyncio
@@ -525,6 +529,34 @@ async def test_cancel_interrupts_in_flight_wait_converges_cancelled(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_cancel_clears_a_prior_retry_error_kind(monkeypatch):
+    """Cancellation settles SKIPPED and must not retain the failed attempt's kind."""
+    from cli_agent_orchestrator.services.agent_step import StepCancelledError
+
+    calls = {"n": 0}
+
+    async def _side(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StepExecutionError("provider refused", kind="provider_error", terminal_id="tp")
+        ws.cancel_run(kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"])
+        await kwargs["cancel_event"].wait()
+        raise StepCancelledError(terminal_id="tc")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.start_run(
+        _spec(steps=[WorkflowStep(id="s1", provider="p", agent="g", prompt="a")]),
+        {},
+        "runCancelKind",
+    )
+
+    assert res.state == RunState.CANCELLED
+    assert res.steps[0].state == StepState.SKIPPED
+    assert res.steps[0].attempts == 2
+    assert res.steps[0].error_kind is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_sets_event_on_record(monkeypatch):
     """cancel_run fires the record's cancel_event (the interrupt seam) in addition
     to flagging cancelled — so an in-flight wait can observe it immediately."""
@@ -865,3 +897,304 @@ async def test_drive_failure_journals_generic_error_resolver_infers_error(monkey
     row = workflow_journal.get_run("u9-error")
     steps = workflow_journal.get_steps("u9-error")
     assert _resolve_error_kind(row, steps) == "error"
+
+
+# ---------------------------------------------------------------------------
+# issue #638 — an in-band provider error is a step FAILURE, never a replayable
+# COMPLETED row. The engine classifies, journals honestly, and halts.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_provider_error_step_fails_and_journals_no_replayable_output(monkeypatch):
+    """The load-bearing half of #638 is what is NOT written.
+
+    A ``completed`` journal row is what a replay-safe resume serves WITHOUT launching
+    a terminal, so persisting a provider refusal as one would make the fault permanent
+    and free. The row must read ``failed`` with NO output, which forces re-execution.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    refusal = "API Error (openai.gpt-5.6-terra): 400 Invocation of model ID is not supported."
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(
+            side_effect=StepExecutionError(
+                f"provider error (model_not_available) from codex: {refusal}",
+                kind="provider_error",
+                terminal_id="t-provider",
+            )
+        ),
+    )
+
+    res = await ws.start_run(_spec(retries=0, on_failure="halt"), {}, "runProviderErr")
+
+    assert res.state == RunState.FAILED
+    step = res.steps[0]
+    # Criterion 5: the RESULT distinguishes a provider refusal from a worker crash
+    # (``error``) and a timeout (``timeout``) without scraping text; criterion 2
+    # keeps the raw provider text retrievable.
+    assert (step.state, step.error_kind) == (StepState.FAILED, "provider_error")
+    assert refusal in (step.error or "")
+
+    row = workflow_journal.get_step("runProviderErr", "s1")
+    assert row is not None
+    assert (row.state, row.error_kind, row.output_json) == ("failed", "provider_error", None)
+
+
+# ---------------------------------------------------------------------------
+# issue #638 second review (fanhongy P2-2) — the provider_error failure path
+# must reclaim the terminal it created, or every retry leaks a live/idle CLI.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_provider_error_retries_do_not_leak_terminals(monkeypatch):
+    """Drive the REAL ``run_agent_step`` (only its terminal layer is mocked) through
+    the YAML retry loop and assert every attempt's terminal is reclaimed.
+
+    A step with default retries calls ``run_agent_step(teardown=True)`` once per
+    attempt with a FRESH terminal, and the drive loop overwrites ``st.terminal_id``
+    each time -- so any attempt whose terminal is not torn down becomes an
+    unreferenced live CLI (fanhongy P2-2). Before the fix the created and deleted
+    counts were 3 and 0; now both must be 3.
+    """
+    import cli_agent_orchestrator.services.agent_step as agent_step
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    refusal = (
+        "API Error: 400 invalid params, messages.4.content.1.tool_use.input: "
+        "Input should be a valid dictionary (2013)"
+    )
+    context = f"⏺ {refusal}\n❯"
+
+    created: List[str] = []
+    deleted: List[str] = []
+    exited: List[str] = []
+
+    async def _create_terminal(*args, **kwargs):
+        terminal = MagicMock()
+        terminal.id = f"t{len(created) + 1}"
+        created.append(terminal.id)
+        return terminal
+
+    monkeypatch.setattr(ts, "create_terminal", AsyncMock(side_effect=_create_terminal))
+    monkeypatch.setattr(ts, "send_input", MagicMock(return_value=True))
+    monkeypatch.setattr(ts, "get_output", MagicMock(return_value=refusal))
+    monkeypatch.setattr(ts, "get_output_context", MagicMock(return_value=context))
+    monkeypatch.setattr(
+        ts, "exit_terminal_cli", MagicMock(side_effect=lambda tid: exited.append(tid))
+    )
+    monkeypatch.setattr(
+        ts,
+        "delete_terminal",
+        MagicMock(side_effect=lambda tid, registry=None, end_reason=None: deleted.append(tid)),
+    )
+    monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        agent_step.status_monitor, "get_status", MagicMock(return_value=TerminalStatus.COMPLETED)
+    )
+
+    res = await ws.start_run(_spec(retries=2, on_failure="halt"), {}, "runProviderLeak")
+
+    assert res.state == RunState.FAILED
+    # retries=2 -> 3 attempts, each on its own fresh terminal.
+    assert len(created) == 3
+    # Every one was reclaimed (exit-then-delete), not just the last.
+    assert sorted(deleted) == sorted(created)
+    assert sorted(exited) == sorted(created)
+
+
+@pytest.mark.asyncio
+async def test_reprompt_keeps_the_rendered_attempt_prompt(monkeypatch):
+    prompts = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    spec = _spec(schema=_SCHEMA)
+    spec.inputs = {"pr_number": InputDecl(type="int", required=True)}
+    spec.steps[0].prompt = "Review PR {{workflow.inputs.pr_number}}"
+
+    result = await ws.start_run(spec, {"pr_number": 869}, "rendered-reprompt")
+
+    assert result.steps[0].state == StepState.COMPLETED_UNVALIDATED
+    assert len(prompts) == 2
+    assert prompts[0] == "Review PR 869"
+    assert prompts[1].startswith("Review PR 869\n\n")
+    assert "workflow_return" in prompts[1]
+    assert "{{" not in prompts[1]
+
+
+# ---------------------------------------------------------------------------
+# Step params and call type (the workflow builder's step fields)
+# ---------------------------------------------------------------------------
+_BLOCK = "\n\nParameters for this step:\n"
+
+
+def _params_step(params=None, *, step_id="s1", call=None, prompt="go", **extra) -> WorkflowStep:
+    return WorkflowStep(
+        id=step_id,
+        provider="claude_code",
+        agent="dev",
+        prompt=prompt,
+        params=params,
+        call=call,
+        **extra,
+    )
+
+
+def test_build_step_prompt_without_params_is_the_substituted_prompt():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step(prompt="about {{workflow.inputs.topic}}")
+
+    assert ws._build_step_prompt(step, rec) == ws._substitute(step.prompt, rec) == "about cats"
+
+
+def test_build_step_prompt_with_empty_params_adds_no_block():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step({}, prompt="about {{workflow.inputs.topic}}")
+
+    assert ws._build_step_prompt(step, rec) == "about cats"
+
+
+def test_build_step_prompt_appends_params_in_declaration_order():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step(
+        {"table-name": "example-table", "aws-profile-name": "beta"},
+        prompt="Check {{workflow.inputs.topic}}.",
+    )
+
+    assert ws._build_step_prompt(step, rec) == (
+        "Check cats.\n"
+        "\n"
+        "Parameters for this step:\n"
+        "- table-name: example-table\n"
+        "- aws-profile-name: beta"
+    )
+
+
+def test_param_values_are_literal_and_never_substituted():
+    """A value that looks like a placeholder is sent as text. Substituting it would raise here."""
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step({"note": "{{workflow.inputs.missing}}"})
+
+    assert ws._build_step_prompt(step, rec) == "go" + _BLOCK + "- note: {{workflow.inputs.missing}}"
+
+
+def test_build_step_prompt_template_override_keeps_the_params_block():
+    rec = _record_with(inputs={"topic": "cats"})
+    step = _params_step({"k": "v"})
+
+    assert ws._build_step_prompt(step, rec, "redo {{workflow.inputs.topic}}") == (
+        "redo cats" + _BLOCK + "- k: v"
+    )
+
+
+def test_build_step_prompt_still_raises_for_an_unresolvable_template():
+    rec = _record_with()
+    with pytest.raises(ws.WorkflowEngineError):
+        ws._build_step_prompt(_params_step({"k": "v"}, prompt="{{workflow.inputs.nope}}"), rec)
+
+
+@pytest.mark.asyncio
+async def test_a_spec_without_params_sends_the_unchanged_prompt(monkeypatch):
+    prompts: List[str] = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    result = await ws.start_run(_spec(), {}, "no-params")
+
+    assert result.state == RunState.COMPLETED
+    assert prompts == ["go"]
+
+
+@pytest.mark.asyncio
+async def test_every_attempt_sends_the_params_block(monkeypatch):
+    """A retry rebuilds the prompt through the same helper, so it carries the same params."""
+    prompts: List[str] = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        if len(prompts) == 1:
+            raise StepExecutionError("boom", kind="error", terminal_id="tx")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    spec = _spec(steps=[_params_step({"aws-profile-name": "beta"}, retries=1)])
+
+    result = await ws.start_run(spec, {}, "params-retry")
+
+    assert result.steps[0].attempts == 2
+    assert prompts == ["go" + _BLOCK + "- aws-profile-name: beta"] * 2
+
+
+@pytest.mark.asyncio
+async def test_the_reprompt_repeats_the_params_block(monkeypatch):
+    prompts: List[str] = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    spec = _spec(steps=[_params_step({"table-name": "t1"}, output_schema=_SCHEMA)])
+
+    result = await ws.start_run(spec, {}, "params-reprompt")
+
+    assert result.steps[0].state == StepState.COMPLETED_UNVALIDATED
+    first = "go" + _BLOCK + "- table-name: t1"
+    assert prompts[0] == first
+    assert prompts[1].startswith(first + "\n\n")
+    assert "workflow_return" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_handoff_and_no_call_both_run(monkeypatch):
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    spec = _spec(steps=[_params_step(step_id="s1", call="handoff"), _params_step(step_id="s2")])
+
+    result = await ws.start_run(spec, {}, "handoff-run")
+
+    assert result.state == RunState.COMPLETED
+    assert mock.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["assign", "send_message"])
+async def test_a_reserved_call_is_refused_before_any_terminal_or_journal_row(monkeypatch, call):
+    """Never run as a handoff (B3-BR-10), and refused before the run record exists."""
+    mock = AsyncMock(return_value=_ok())
+    inserted = MagicMock()
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    monkeypatch.setattr(ws, "_journal_insert_run", inserted)
+    spec = _spec(
+        steps=[_params_step(step_id="s1", call="handoff"), _params_step(step_id="s2", call=call)]
+    )
+
+    with pytest.raises(NotBuiltYetError) as excinfo:
+        await ws.start_run(spec, {}, f"run-{call.replace('_', '-')}")
+
+    assert str(excinfo.value) == f"step 's2' uses call '{call}', which is reserved (not built yet)"
+    mock.assert_not_awaited()
+    inserted.assert_not_called()
+    assert ws.run_registry == {}
+    assert ws._active_drives == set()
+
+
+def test_refuse_reserved_calls_names_the_first_reserved_step():
+    spec = _spec(
+        steps=[
+            _params_step(step_id="a"),
+            _params_step(step_id="b", call="send_message"),
+            _params_step(step_id="c", call="assign"),
+        ]
+    )
+    with pytest.raises(NotBuiltYetError, match="^step 'b' uses call 'send_message'"):
+        ws._refuse_reserved_calls(spec)
+    ws._refuse_reserved_calls(
+        _spec(steps=[_params_step(call="handoff"), _params_step(step_id="s2")])
+    )

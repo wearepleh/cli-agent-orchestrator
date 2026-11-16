@@ -1,6 +1,10 @@
 import { create } from 'zustand'
 import {
   api,
+  errorDetailText,
+  sessionDescriptionRevision,
+  SESSION_DESCRIPTION_READ_ATTEMPTS,
+  ApiError,
   Session,
   SessionDetail,
   TerminalMeta,
@@ -19,6 +23,13 @@ interface Snackbar {
   type: 'success' | 'error' | 'info'
   message: string
 }
+
+// What starting a workflow run produced: the new run id, the plan id a human
+// must approve first (issue #583 approval gate), or null on any other error.
+export type StartRunOutcome =
+  | { runId: string }
+  | { approvalPlanId: string; message?: string }
+  | null
 
 interface Store {
   sessions: Session[]
@@ -60,9 +71,16 @@ interface Store {
   // (PR #526 review round 3). Distinct from `selectedRun?.run_id`, which is null
   // while a fetch is in flight and therefore useless as a guard.
   selectedRunId: string | null
+  // Why the last selectWorkflowRun failed to load its run, or null. The run
+  // page shows it in place of a spinner that would never stop.
+  selectedRunError: string | null
   wfEvents: WorkflowEvent[]
   wfGaps: GapMarker[]
   selectedIndex: number
+  // True while the timeline selection follows the newest event: each event
+  // that arrives selects itself. Picking an event (a click, the transport, the
+  // scrubber) stops following; `followLatestEvent` resumes it.
+  followLatest: boolean
   followConnected: boolean
 
   // Resolves to an error message when the list read failed, or null on success.
@@ -71,10 +89,19 @@ interface Store {
   // poll cannot produce an unhandled rejection.
   fetchWorkflowRuns: () => Promise<string | null>
   selectWorkflowRun: (runId: string | null) => Promise<void>
+  refreshSelectedRun: () => Promise<void>
+  // Workflow run controls. Each surfaces a snackbar,
+  // refreshes the run list, and (re)selects the affected run so the detail pane
+  // follows it live. startWorkflowRun resolves to a StartRunOutcome.
+  startWorkflowRun: (nameOrPath: string, inputs: Record<string, unknown>, runId?: string) => Promise<StartRunOutcome>
+  cancelWorkflowRun: (runId: string) => Promise<void>
+  resumeWorkflowRun: (runId: string) => Promise<StartRunOutcome>
   setWorkflowEvents: (events: WorkflowEvent[], gaps: GapMarker[]) => void
   appendWorkflowEvent: (event: WorkflowEvent) => void
   addWorkflowGap: (gap: GapMarker) => void
   setSelectedIndex: (index: number) => void
+  // Select the newest event and follow new ones again (the timeline's Latest).
+  followLatestEvent: () => void
   setFollowConnected: (connected: boolean) => void
   clearSelectedRun: () => void
 }
@@ -91,9 +118,11 @@ export const useStore = create<Store>((set, get) => ({
   workflowRuns: [],
   selectedRun: null,
   selectedRunId: null,
+  selectedRunError: null,
   wfEvents: [],
   wfGaps: [],
   selectedIndex: 0,
+  followLatest: true,
   followConnected: false,
 
   fetchSessions: async () => {
@@ -121,12 +150,27 @@ export const useStore = create<Store>((set, get) => ({
     }
     set({ activeSession: name })
     try {
-      const detail = await api.getSession(name)
-      if (!jsonEqual(get().activeSessionDetail, detail)) {
-        set({ activeSessionDetail: detail })
+      // A PATCH can complete between the API promise resolving and this
+      // continuation. Bound this second revision check as well as the API's.
+      for (let attempt = 0; attempt < SESSION_DESCRIPTION_READ_ATTEMPTS; attempt++) {
+        const revision = sessionDescriptionRevision
+        const detail = await api.getSession(name)
+        if (get().activeSession !== name) return
+        if (revision !== sessionDescriptionRevision) continue
+        if (!jsonEqual(get().activeSessionDetail, detail)) {
+          set({ activeSessionDetail: detail })
+        }
+        return
       }
-    } catch {
-      set({ activeSessionDetail: null })
+      throw new Error('Session descriptions kept changing; retry on the next poll')
+    } catch (error) {
+      // Preserve the mounted editor on transient failures, but remove deleted
+      // sessions. A late failure must never clear a different selection.
+      if (get().activeSession === name && (
+        (error as ApiError | null)?.status === 404 || get().activeSessionDetail?.session.id !== name
+      )) {
+        set({ activeSessionDetail: null })
+      }
     }
   },
 
@@ -206,9 +250,11 @@ export const useStore = create<Store>((set, get) => ({
     set({
       selectedRun: null,
       selectedRunId: runId,
+      selectedRunError: null,
       wfEvents: [],
       wfGaps: [],
       selectedIndex: 0,
+      followLatest: true,
       followConnected: false,
     })
     try {
@@ -235,8 +281,76 @@ export const useStore = create<Store>((set, get) => ({
       // arriving after B succeeded would blank B's loaded detail pane and blame it
       // for an error that belongs to a run the user already navigated away from.
       if (get().selectedRunId !== runId) return
-      set({ selectedRun: null })
-      get().showSnackbar({ type: 'error', message: e?.message || 'Failed to load run' })
+      const message = e?.message || 'Failed to load run'
+      set({ selectedRun: null, selectedRunError: message })
+      get().showSnackbar({ type: 'error', message })
+    }
+  },
+
+  // Re-read the selected run's inspection (state + steps) in place. Unlike
+  // selectWorkflowRun it neither blanks the pane nor resets the timeline, so the
+  // detail can poll it while a run is live. Same stale-response guard; a failed
+  // read keeps the last snapshot and the next poll retries.
+  refreshSelectedRun: async () => {
+    const runId = get().selectedRunId
+    if (!runId || !get().selectedRun) return
+    try {
+      const inspection = await api.inspectWorkflowRun(runId)
+      if (get().selectedRunId !== runId) return
+      set({ selectedRun: inspection })
+    } catch { /* keep the last snapshot */ }
+  },
+
+  startWorkflowRun: async (nameOrPath, inputs, runId) => {
+    try {
+      const ack = await api.submitWorkflowRun({
+        name_or_path: nameOrPath,
+        inputs,
+        run_id: runId || undefined,
+      })
+      get().showSnackbar({ type: 'success', message: `Started run ${ack.run_id}` })
+      await get().fetchWorkflowRuns()
+      await get().selectWorkflowRun(ack.run_id)
+      return { runId: ack.run_id }
+    } catch (e: any) {
+      // A first run of a new plan is refused until a human approves it. That is
+      // an expected step, not a failure, so hand the plan id back to the caller.
+      const planId = e?.detailMeta?.plan_id
+      if (e?.kind === 'approval_required' && typeof planId === 'string' && planId) {
+        return { approvalPlanId: planId, message: e?.detail }
+      }
+      // A refused run, such as a 422 for a step param, shows every message the server sent.
+      get().showSnackbar({ type: 'error', message: errorDetailText(e) || e?.message || 'Failed to start workflow run' })
+      return null
+    }
+  },
+
+  cancelWorkflowRun: async (runId) => {
+    try {
+      await api.cancelWorkflowRun(runId)
+      get().showSnackbar({ type: 'success', message: `Cancelling ${runId}` })
+      await get().fetchWorkflowRuns()
+      if (get().selectedRunId === runId) await get().selectWorkflowRun(runId)
+    } catch (e: any) {
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to cancel run' })
+    }
+  },
+
+  resumeWorkflowRun: async (runId) => {
+    try {
+      await api.resumeWorkflowRun(runId)
+      get().showSnackbar({ type: 'success', message: `Resuming ${runId}` })
+      await get().fetchWorkflowRuns()
+      if (get().selectedRunId === runId) await get().selectWorkflowRun(runId)
+      return { runId }
+    } catch (e: any) {
+      // Resume re-checks the plan, so an edited script comes back approval_required.
+      const planId = e?.detailMeta?.plan_id
+      if (e?.kind === 'approval_required' && typeof planId === 'string' && planId) {
+        return { approvalPlanId: planId, message: e?.detail }
+      }
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to resume run' })
+      return null
     }
   },
 
@@ -257,7 +371,15 @@ export const useStore = create<Store>((set, get) => ({
       let i = events.length
       while (i > 0 && events[i - 1].seq > event.seq) i--
       events.splice(i, 0, event)
-      return { wfEvents: events }
+      // While following, the newest event selects itself. Otherwise the
+      // selection stays on the event the user picked: an insert at or before it
+      // moves that event one place down the list.
+      const selectedIndex = state.followLatest
+        ? events.length - 1
+        : i <= state.selectedIndex && state.wfEvents.length > 0
+          ? state.selectedIndex + 1
+          : state.selectedIndex
+      return { wfEvents: events, selectedIndex }
     }),
 
   addWorkflowGap: (gap) =>
@@ -274,8 +396,17 @@ export const useStore = create<Store>((set, get) => ({
     set(state => {
       const max = Math.max(0, state.wfEvents.length - 1)
       const clamped = Math.min(Math.max(0, index), max)
-      if (clamped === state.selectedIndex) return state
-      return { selectedIndex: clamped }
+      // Every caller is a user's pick (a row, the transport, the scrubber), so
+      // the selection stops following the newest event.
+      if (clamped === state.selectedIndex && !state.followLatest) return state
+      return { selectedIndex: clamped, followLatest: false }
+    }),
+
+  followLatestEvent: () =>
+    set(state => {
+      const last = Math.max(0, state.wfEvents.length - 1)
+      if (state.followLatest && state.selectedIndex === last) return state
+      return { selectedIndex: last, followLatest: true }
     }),
 
   setFollowConnected: (connected) =>
@@ -287,9 +418,11 @@ export const useStore = create<Store>((set, get) => ({
       // Cleared too, so an in-flight fetch for the run being closed cannot resolve
       // afterwards and re-populate a pane the user has dismissed.
       selectedRunId: null,
+      selectedRunError: null,
       wfEvents: [],
       wfGaps: [],
       selectedIndex: 0,
+      followLatest: true,
       followConnected: false,
     }),
 }))

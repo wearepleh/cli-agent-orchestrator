@@ -391,7 +391,7 @@ class TestValidateAgentProfileEndpoint:
 
     def test_schema_violation_is_an_error_with_a_path(self, client) -> None:
         """JSON-Schema failures must be error severity and carry the field path."""
-        content = "---\nname: test-agent\nengine: v3\n---\n\nBody.\n"
+        content = "---\nname: test-agent\nengine: v4\n---\n\nBody.\n"
         response = client.post("/agents/profiles/validate", json={"content": content})
 
         assert response.status_code == 200
@@ -413,7 +413,7 @@ class TestValidateAgentProfileEndpoint:
         response = client.post("/agents/profiles/validate", json={"content": content})
 
         assert response.status_code == 200
-        assert response.json() == {"valid": True, "messages": []}
+        assert response.json() == {"valid": True, "messages": [], "params": None}
 
     def test_missing_required_name_is_an_error(self, client) -> None:
         """``name`` is the only required field; omitting it must invalidate."""
@@ -568,6 +568,37 @@ def write_store(tmp_path, monkeypatch):
 class TestCreateAgentProfileEndpoint:
     """POST /agents/profiles -- create from a supplied document."""
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_swarm_options_validate_create_and_replace(self, client, write_store, enabled):
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        content = (
+            "---\nname: bounded-kimi\ndescription: A bounded native worker.\nprovider: kimi_cli\n"
+            f"kimiSwarm: {str(enabled).lower()}\nkimiSwarmMaxConcurrency: 4\n---\nReview the input."
+        )
+        validation = client.post("/agents/profiles/validate", json={"content": content})
+        assert validation.status_code == 200
+        assert validation.json()["valid"] is True
+        created = client.post("/agents/profiles", json={"name": "bounded-kimi", "content": content})
+        assert created.status_code == 201
+        assert (write_store / "bounded-kimi.md").read_text() == content
+        loaded = load_agent_profile("bounded-kimi")
+        assert loaded.kimiSwarm is enabled
+        assert loaded.kimiSwarmMaxConcurrency == 4
+
+        updated = content.replace("kimiSwarmMaxConcurrency: 4", "kimiSwarmMaxConcurrency: 1")
+        assert (
+            client.put("/agents/profiles/bounded-kimi", json={"content": updated}).status_code
+            == 200
+        )
+        assert load_agent_profile("bounded-kimi").kimiSwarmMaxConcurrency == 1
+        invalid = updated.replace("kimiSwarmMaxConcurrency: 1", "kimiSwarmMaxConcurrency: 11")
+        assert (
+            client.put("/agents/profiles/bounded-kimi", json={"content": invalid}).status_code
+            == 400
+        )
+        assert (write_store / "bounded-kimi.md").read_text() == updated
+
     def test_creates_a_profile_and_returns_201(self, client, write_store) -> None:
         response = client.post(
             "/agents/profiles",
@@ -587,7 +618,7 @@ class TestCreateAgentProfileEndpoint:
 
     def test_invalid_profile_is_rejected_and_not_written(self, client, write_store) -> None:
         """Validation runs before persistence, so nothing reaches disk."""
-        content = "---\nname: bad\nengine: v3\n---\n\nBody.\n"
+        content = "---\nname: bad\nengine: v4\n---\n\nBody.\n"
 
         response = client.post("/agents/profiles", json={"name": "bad", "content": content})
 
@@ -694,7 +725,7 @@ class TestReplaceAgentProfileEndpoint:
 
         response = client.put(
             "/agents/profiles/guarded",
-            json={"content": "---\nname: guarded\nengine: v3\n---\n\nBody.\n"},
+            json={"content": "---\nname: guarded\nengine: v4\n---\n\nBody.\n"},
         )
 
         assert response.status_code == 400
@@ -871,7 +902,7 @@ class TestWriteRejectionShape:
             "post: schema error",
             "post",
             "/agents/profiles",
-            {"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
+            {"name": "x", "content": "---\nname: x\nengine: v4\n---\n\nB.\n"},
         ),
         (
             "post: name mismatch",
@@ -927,7 +958,7 @@ class TestWriteRejectionShape:
         """A schema failure must say which field, so a form can render it."""
         response = client.post(
             "/agents/profiles",
-            json={"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
+            json={"name": "x", "content": "---\nname: x\nengine: v4\n---\n\nB.\n"},
         )
 
         errors = response.json()["detail"]["errors"]

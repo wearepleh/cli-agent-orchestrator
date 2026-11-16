@@ -7,7 +7,7 @@ These tests pin the resolution, so a message meant for one agent cannot be
 delivered to whichever pane happens to be focused.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from libtmux.constants import PaneDirection
@@ -189,7 +189,7 @@ class TestCreatePane:
         return session, host_window
 
     def test_marks_the_new_pane_with_the_terminal_name(self, tmux, tmp_path):
-        from cli_agent_orchestrator.clients.tmux import TERMINAL_MARK_OPTION
+        from cli_agent_orchestrator.clients.tmux import TERMINAL_ID_OPTION, TERMINAL_MARK_OPTION
 
         _, host_window = self._session(tmux)
         new_pane = host_window.split.return_value
@@ -197,7 +197,32 @@ class TestCreatePane:
         result = tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
 
         assert result == "coder-3"
-        new_pane.set_option.assert_called_once_with(TERMINAL_MARK_OPTION, "coder-3")
+        # The name mark addresses the pane for lookups; the id mark is what
+        # exact-identity teardown matches on, and both are stamped at creation.
+        assert new_pane.set_option.call_args_list == [
+            call(TERMINAL_MARK_OPTION, "coder-3"),
+            call(TERMINAL_ID_OPTION, "tid"),
+        ]
+
+    def test_raises_the_shared_servers_history_limit(self, tmux, tmp_path):
+        """A session that predates this fix must still get the scrollback floor
+        raised before the split pane exists (#728)."""
+        from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
+
+        self._session(tmux)
+
+        def cmd(*args):
+            if "show-options" in args:
+                return MagicMock(returncode=0, stdout=["history-limit 2000"], stderr=[])
+            return MagicMock(returncode=0, stdout=[], stderr=[])
+
+        tmux.server.cmd.side_effect = cmd
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        tmux.server.cmd.assert_any_call(
+            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+        )
 
     def test_rebalances_the_window(self, tmux, tmp_path):
         _, host_window = self._session(tmux)
@@ -303,6 +328,36 @@ class TestCreatePane:
         env = session.new_window.call_args.kwargs["environment"]
         assert env["CLAUDE_CONFIG_DIR"] == "/abs/.claude-b"
 
+    def test_split_pane_sets_histfile_to_dev_null_over_forwarded(self, tmux, tmp_path):
+        """The pane shell must not write agent launch commands to the user's history."""
+        _, host_window = self._session(tmux)
+
+        tmux.create_pane(
+            "ses",
+            "cao-agents",
+            "coder-3",
+            "tid-42",
+            str(tmp_path),
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+
+        assert host_window.split.call_args.kwargs["environment"]["HISTFILE"] == "/dev/null"
+
+    def test_first_pane_of_a_new_host_window_sets_histfile_to_dev_null(self, tmux, tmp_path):
+        session = session_with()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane(
+            "ses",
+            "cao-agents",
+            "coder-3",
+            "tid-42",
+            str(tmp_path),
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+
+        assert session.new_window.call_args.kwargs["environment"]["HISTFILE"] == "/dev/null"
+
     def test_refuses_a_name_already_marked(self, tmux, tmp_path):
         """Two panes with one mark would make every later lookup ambiguous."""
         _, host_window = self._session(tmux, existing_marks=["coder-3"])
@@ -313,7 +368,7 @@ class TestCreatePane:
 
     def test_an_absent_host_window_is_created(self, tmux, tmp_path):
         """Nothing in CAO makes this window, so the first pane terminal must."""
-        from cli_agent_orchestrator.clients.tmux import TERMINAL_MARK_OPTION
+        from cli_agent_orchestrator.clients.tmux import TERMINAL_ID_OPTION, TERMINAL_MARK_OPTION
 
         session = session_with()
         tmux.server.sessions.get.return_value = session
@@ -321,7 +376,10 @@ class TestCreatePane:
 
         assert tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path)) == "coder-3"
         assert session.new_window.call_args.kwargs["window_name"] == "cao-agents"
-        new_pane.set_option.assert_called_once_with(TERMINAL_MARK_OPTION, "coder-3")
+        assert new_pane.set_option.call_args_list == [
+            call(TERMINAL_MARK_OPTION, "coder-3"),
+            call(TERMINAL_ID_OPTION, "tid"),
+        ]
 
     def test_a_full_host_window_asks_for_a_window_instead(self, tmux, tmp_path):
         """tmux refuses a split for want of space with a plain LibTmuxException."""
@@ -342,37 +400,352 @@ class TestKillReachesThePane:
         pane = marked_pane("coder-3", "%4")
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
 
-        assert tmux.kill_window("ses", "coder-3") is True
+        assert tmux.kill_window("cao-ses", "coder-3") is True
         pane.kill.assert_called_once()
 
     def test_unknown_terminal_is_not_a_kill(self, tmux):
         pane = marked_pane("reviewer-7", "%3")
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
 
-        assert tmux.kill_window("ses", "coder-3") is False
+        assert tmux.kill_window("cao-ses", "coder-3") is False
         pane.kill.assert_not_called()
 
 
-class TestAttachCommand:
-    def test_selects_the_window_before_the_pane(self, tmux):
-        """select-pane alone does not move the active window."""
+class TestWebViewAttachCommand:
+    def test_links_the_panes_window_without_selecting_a_pane(self, tmux):
+        """The WebSocket handler selects the pane (one active pane per window,
+        not per client), so the chain carries no pane target that could fail
+        after the view exists."""
         pane = marked_pane("coder-3", "%4")
         pane.window.window_id = "@2"
         tmux.server.sessions.get.return_value = session_with(panes=[pane])
 
-        argv = tmux.attach_command("ses", "coder-3")
+        argv = tmux.web_view_attach_command("ses", "coder-3")
 
-        assert argv.index("select-window") < argv.index("select-pane")
-        assert argv[argv.index("select-window") + 2] == "@2"
-        assert argv[argv.index("select-pane") + 2] == "%4"
+        assert argv[argv.index("link-window") + 2] == "@2"
+        assert "select-pane" not in argv and "%4" not in argv
 
-    def test_window_terminal_attaches_as_before(self, tmux):
+    def test_window_terminal_links_its_window(self, tmux):
         tmux.server.sessions.get.return_value = session_with(window=MagicMock())
 
-        assert tmux.attach_command("ses", "win") == [
-            "tmux",
-            "-u",
-            "attach-session",
-            "-t",
-            "ses:win",
+        argv = tmux.web_view_attach_command("ses", "win")
+
+        assert argv[argv.index("link-window") + 2] == "ses:win"
+        assert "select-pane" not in argv
+
+
+class TestWebViewAttachPlan:
+    def test_a_pane_terminal_links_the_window_it_names_for_focus(self, tmux):
+        """Argv and focus come from one lookup, so they cannot disagree."""
+        pane = marked_pane("coder-3", "%4")
+        pane.window.window_id = "@2"
+        tmux.server.sessions.get.return_value = session_with(panes=[pane])
+
+        argv, focus = tmux.web_view_attach_plan("ses", "coder-3")
+
+        assert focus == ("@2", "%4")
+        assert argv[argv.index("link-window") + 2] == "@2"
+        assert tmux.server.sessions.get.call_count == 1
+
+    def test_a_window_terminal_needs_no_focus(self, tmux):
+        tmux.server.sessions.get.return_value = session_with(window=MagicMock())
+
+        argv, focus = tmux.web_view_attach_plan("ses", "win")
+
+        assert focus is None
+        assert argv[argv.index("link-window") + 2] == "ses:win"
+
+    def test_an_unreadable_listing_raises_instead_of_needing_no_focus(self, tmux):
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        tmux.server.sessions.get.side_effect = ValueError("not enough values to unpack")
+
+        with pytest.raises(TmuxLookupError):
+            tmux.web_view_attach_plan("ses", "coder-3")
+
+    def test_the_plain_command_still_degrades_to_the_window_target(self, tmux):
+        tmux.server.sessions.get.side_effect = ValueError("not enough values to unpack")
+
+        argv = tmux.web_view_attach_command("ses", "coder-3")
+
+        assert argv[argv.index("link-window") + 2] == "ses:coder-3"
+
+    def test_select_pane_targets_the_pane(self, tmux):
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stderr=[])
+
+        tmux.select_pane("%4")
+
+        tmux.server.cmd.assert_called_once_with("select-pane", "-t", "%4")
+
+    @pytest.mark.parametrize("bad", ["4", "%4; kill-server", "ses:win", "", "%"])
+    def test_select_pane_refuses_anything_but_a_pane_id(self, tmux, bad):
+        with pytest.raises(ValueError):
+            tmux.select_pane(bad)
+        tmux.server.cmd.assert_not_called()
+
+    def test_select_pane_failure_raises(self, tmux):
+        from cli_agent_orchestrator.clients.tmux import TmuxLookupError
+
+        tmux.server.cmd.return_value = MagicMock(returncode=1, stderr=["can't find pane: %4"])
+
+        with pytest.raises(TmuxLookupError):
+            tmux.select_pane("%4")
+
+
+class TestWebViewArgv:
+    def test_view_is_private_and_tagged_with_its_owner(self):
+        from cli_agent_orchestrator.clients.tmux import web_view_attach_argv
+
+        argv = web_view_attach_argv("cao-s", "cao-s:w", view_name="caoweb-x")
+
+        assert argv[argv.index("attach-session") + 2] == "caoweb-x"
+        assert argv[argv.index("@cao_web_view_of") + 1] == "cao-s"
+        # The placeholder window is gone before anything attaches.
+        assert argv.index("kill-window") < argv.index("attach-session")
+        # destroy-unattached only after attaching: set earlier it kills the view.
+        assert argv.index("destroy-unattached") > argv.index("attach-session")
+
+    @pytest.mark.parametrize(
+        "option,value",
+        [
+            # create_session sets mouse on agent sessions (#546); a view starts
+            # from tmux's global default (off), and xterm.js then turns wheel
+            # ticks into Up/Down keys sent to the agent.
+            ("mouse", "on"),
+            # The client exits when the view is destroyed, whatever tmux.conf says.
+            ("detach-on-destroy", "on"),
+        ],
+    )
+    def test_view_sets_session_options_before_attaching(self, option, value):
+        from cli_agent_orchestrator.clients.tmux import web_view_attach_argv
+
+        argv = web_view_attach_argv("cao-s", "cao-s:w", view_name="caoweb-x")
+
+        at = argv.index(option)
+        assert argv[at - 3 : at + 2] == ["set-option", "-t", "caoweb-x", option, value]
+        assert at < argv.index("attach-session")
+
+    def test_web_view_owner_maps_only_views(self):
+        from cli_agent_orchestrator.clients.tmux import web_view_owner
+
+        owners = {"caoweb-x": "cao-s"}
+        assert web_view_owner("caoweb-x", owners.get) == "cao-s"
+        assert web_view_owner("caoweb-gone", owners.get) is None
+        assert web_view_owner("cao-s", owners.get) == "cao-s"
+        assert web_view_owner(None, owners.get) is None
+
+    def test_view_names_never_look_like_cao_sessions(self):
+        from cli_agent_orchestrator.clients.tmux import web_view_attach_argv
+        from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+        argv = web_view_attach_argv("cao-s", "cao-s:w")
+        view = argv[argv.index("attach-session") + 2]
+        assert view.startswith("caoweb-") and not view.startswith(SESSION_PREFIX)
+        assert web_view_attach_argv("cao-s", "cao-s:w") != argv  # fresh name each time
+
+
+class TestWebViewCleanup:
+    def test_kill_session_kills_its_views_first_and_only_its_own(self, tmux):
+        listing = MagicMock(
+            returncode=0,
+            stdout=[
+                "caoweb-a|cao-s",
+                "caoweb-b|cao-other",
+                "caoweb-c|",
+                "personal|cao-s",
+            ],
+        )
+        tmux.server.cmd.return_value = listing
+        tmux.server.sessions.get.return_value = None  # session itself already gone
+
+        tmux.kill_session("cao-s")
+
+        kills = [c.args for c in tmux.server.cmd.call_args_list if c.args[0] == "kill-session"]
+        assert kills == [("kill-session", "-t", "=caoweb-a")]
+
+    def test_view_listing_failure_does_not_block_teardown(self, tmux):
+        tmux.server.cmd.side_effect = RuntimeError("socket gone")
+        tmux.server.sessions.get.return_value = None
+
+        assert tmux.kill_session("cao-s") is False  # absent, not an exception
+
+    def test_unhinted_identity_scan_skips_views(self, tmux):
+        real, view = MagicMock(), MagicMock()
+        real.name, view.name = "cao-s", "caoweb-1"
+        tmux.server.sessions = [real, view]
+
+        assert tmux._sessions_for_identity_scan(None) == [real]
+
+
+# ── captions ─────────────────────────────────────────────────────────
+
+
+def host_window(own_border=None):
+    """A pane window, and the border setting it carries itself.
+
+    Models ``show-options -w``: without ``-A`` tmux lists only what this window
+    sets, so a double that answers for the inherited default cannot see an
+    implementation that asks the window what it set. ``show_option`` is not
+    modelled, because the implementation must not use it.
+    """
+    window = MagicMock()
+    lines = [] if own_border is None else [f"pane-border-status {own_border}"]
+    window.cmd.return_value.stdout = lines
+    return window
+
+
+class TestPaneCaptions:
+    """A shared window is only readable if a person can tell the panes apart.
+
+    The caption reads the mark, not ``pane_title``: measured on tmux 3.6a, a
+    program in the pane sets its own title with OSC 2, so the title becomes
+    whatever the agent's TUI wants while the mark survives.
+    """
+
+    def test_the_caption_format_is_the_one_verified_against_tmux(self):
+        """Pinned to the exact string rendered on tmux 3.6a, not to its shape.
+
+        A malformed conditional still contains the mark, so a substring check
+        passes on a format tmux would refuse. Renaming the mark fails this on
+        purpose: the renamed format has not been put in front of tmux.
+        """
+        from cli_agent_orchestrator.clients.tmux import BORDER_CAPTION_FORMAT
+
+        assert BORDER_CAPTION_FORMAT == " #{?@cao_terminal,#{@cao_terminal},#{pane_index}} "
+
+    def test_the_caption_never_reads_the_pane_title(self):
+        from cli_agent_orchestrator.clients.tmux import BORDER_CAPTION_FORMAT
+
+        assert "pane_title" not in BORDER_CAPTION_FORMAT
+
+    def test_a_created_host_window_is_captioned(self, tmux, tmp_path):
+        from cli_agent_orchestrator.clients.tmux import (
+            BORDER_CAPTION_FORMAT,
+            BORDER_FORMAT_OPTION,
+            BORDER_STATUS_OPTION,
+            BORDER_STATUS_TOP,
+        )
+
+        session = session_with()
+        window = host_window()
+        session.new_window.return_value = window
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        assert window.set_option.call_args_list == [
+            call(BORDER_STATUS_OPTION, BORDER_STATUS_TOP),
+            call(BORDER_FORMAT_OPTION, BORDER_CAPTION_FORMAT),
         ]
+
+    def test_a_window_opened_before_captions_existed_gets_them(self, tmux, tmp_path):
+        """The window outlives cao-server, so creation time is not the only chance."""
+        from cli_agent_orchestrator.clients.tmux import BORDER_STATUS_OPTION
+
+        window = host_window()
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        assert BORDER_STATUS_OPTION in str(window.set_option.call_args_list)
+
+    @pytest.mark.parametrize("own_border", ["off", "top", "bottom"])
+    def test_a_window_with_its_own_border_setting_is_left_alone(self, tmux, tmp_path, own_border):
+        """Somebody who set this deliberately keeps it — including ``off``."""
+        window = host_window(own_border=own_border)
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        window.set_option.assert_not_called()
+
+    def test_the_setting_never_leaves_that_window(self, tmux, tmp_path):
+        """Window scope only, so the user's own windows keep their borders."""
+        session = session_with()
+        session.new_window.return_value = host_window()
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        for mock in (session.set_option, tmux.server.set_option):
+            assert not [c for c in mock.call_args_list if "pane-border" in str(c)]
+
+    def test_a_tmux_that_refuses_the_options_still_gives_the_terminal(self, tmux, tmp_path):
+        """The captions are cosmetic; losing them must not lose the spawn."""
+        session = session_with()
+        window = host_window()
+        window.set_option.side_effect = LibTmuxException("unknown option: pane-border-status")
+        session.new_window.return_value = window
+        tmux.server.sessions.get.return_value = session
+
+        assert tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path)) == "coder-3"
+
+    def test_a_tmux_that_refuses_the_read_still_gives_the_terminal(self, tmux, tmp_path):
+        """Asking the window what it set is the first thing that can fail."""
+        window = host_window()
+        window.cmd.side_effect = LibTmuxException("no server running")
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        assert tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path)) == "coder-3"
+
+    def test_the_caption_comes_after_the_split(self, tmux, tmp_path):
+        """A caption costs a row per pane, so it must not decide whether this fits."""
+        window = host_window()
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        names = [c[0] for c in window.mock_calls]
+        assert names.index("split") < names.index("set_option")
+
+    def test_a_full_window_is_still_captioned(self, tmux, tmp_path):
+        """The placement is settled once the split has been tried, so caption anyway.
+
+        Otherwise a window already at capacity when it was opened by an earlier
+        version would never be captioned: every spawn into it raises first.
+        """
+        from cli_agent_orchestrator.clients.tmux import (
+            BORDER_STATUS_OPTION,
+            PaneSpawnUnavailable,
+        )
+
+        window = host_window()
+        window.split.side_effect = LibTmuxException("no space for new pane")
+        session = session_with(window=window)
+        tmux.server.sessions.get.return_value = session
+
+        with pytest.raises(PaneSpawnUnavailable):
+            tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        assert BORDER_STATUS_OPTION in str(window.set_option.call_args_list)
+
+
+class TestEscapeTime:
+    def test_reads_the_server_option(self, tmux):
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stdout=["500"], stderr=[])
+
+        assert tmux.escape_time_ms() == 500
+        tmux.server.cmd.assert_called_once_with("show-options", "-sv", "escape-time")
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            MagicMock(returncode=1, stdout=[], stderr=["no server running"]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),
+            MagicMock(returncode=0, stdout=["ten"], stderr=[]),
+        ],
+        ids=["failed", "empty", "not-a-number"],
+    )
+    def test_an_unreadable_answer_is_none(self, tmux, result):
+        tmux.server.cmd.return_value = result
+
+        assert tmux.escape_time_ms() is None
+
+    def test_a_server_error_is_none(self, tmux):
+        tmux.server.cmd.side_effect = LibTmuxException("no server running")
+
+        assert tmux.escape_time_ms() is None

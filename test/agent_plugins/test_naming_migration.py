@@ -80,6 +80,8 @@ _UNQUALIFIED_PLUGIN = re.compile(r"(?<![\w-])(?<!agent )(?<!event )plugins?\b", 
 #: vocabulary backlog, brought in line: every occurrence was an event-plugin
 #: reference and now says so.
 _UNSCOPED_DOCS = [
+    # #801 ephemeral agents: one agent-plugin reference, in the honesty statement.
+    "ephemeral-agents.md",
     "skills.md",
     "control-planes.md",
     "codex-cli.md",
@@ -103,6 +105,13 @@ _UNSCOPED_DOCS = [
     "kiro-cli.md",
     "claude-code.md",
     "copilot-cli.md",
+    # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
+    # delivery as a launch input outside plan_id. CAO's own noun, qualified.
+    "workflows.md",
+    # PR #652: the weekly release does not count the bot's
+    # `chore(agent-plugin): repin packages to vX.Y.Z` commit, and the doc quotes that
+    # subject so an operator can recognise it. CAO's own noun, inside a code span.
+    "RELEASING.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare
@@ -123,6 +132,12 @@ _VOCABULARY_BACKLOG_DOCS = [
     "cursor-cli.md",  # a Cursor plugin manifest — third-party, qualifying it would be wrong
     "opencode-cli.md",  # OpenCode's own plugin system (its Node.js prerequisite) — same reason
     "minimax-code.md",  # MiniMax's own "Plugin" schema and user-installed Plugins — same reason
+    # Its one bare "plugin" is the operator's Claude Code plugins (the subagent bullet:
+    # "can be any agent in the operator's Claude Code agent store or plugins"). That is
+    # Claude Code's own extension system, not a CAO agent plugin, so no CAO qualifier fits.
+    # The doc does not cite CAO agent plugins, so it stays out of
+    # _THIRD_PARTY_DOCS_CITING_AGENT_PLUGINS.
+    "tool-restrictions.md",
 ]
 
 #: Third-party-plugin docs that **also** legitimately reference CAO's agent

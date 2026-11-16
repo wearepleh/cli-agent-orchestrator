@@ -5,8 +5,6 @@ and the workspace-trust handling in _handle_startup_prompts (including the
 regression where the echoed launch command false-matched the idle prompt).
 """
 
-import re
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,7 +23,7 @@ def provider():
 class TestBuildCommandMcpServerModelDump:
     """Test the model_dump branch in _build_claude_command (line 93)."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_mcp_server_with_model_dump(self, mock_load, provider):
         """When mcpServers contains a Pydantic model (not dict), model_dump is called."""
         mock_mcp = MagicMock()
@@ -154,7 +152,10 @@ class TestDatabaseListAllTerminals:
         mock_terminal.last_active = None
 
         mock_db = MagicMock()
-        mock_db.query.return_value.all.return_value = [mock_terminal]
+        # The listing outer-joins the #1225 keep table and reads (row, kept_until) pairs.
+        mock_db.query.return_value.outerjoin.return_value.add_columns.return_value.all.return_value = [
+            (mock_terminal, None)
+        ]
         mock_session_class.return_value.__enter__ = MagicMock(return_value=mock_db)
         mock_session_class.return_value.__exit__ = MagicMock(return_value=False)
 

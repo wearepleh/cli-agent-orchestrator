@@ -114,8 +114,8 @@ async def recall_memory(
     memory_type: Optional[str],
     limit: int,
     terminal_context: Optional[dict[str, Any]],
-    search_mode: str,
-    sort_by: str,
+    search_mode: Optional[str],
+    sort_by: Optional[str],
     include_related: bool,
 ):
     if not remote_memory_url():
@@ -129,10 +129,9 @@ async def recall_memory(
             sort_by=sort_by,
             include_related=include_related,
         )
-    payload = await asyncio.to_thread(
-        _post,
-        "/internal/memory/recall",
-        {
+    body = {
+        key: value
+        for key, value in {
             "query": query,
             "scope": scope,
             "memory_type": memory_type,
@@ -141,7 +140,13 @@ async def recall_memory(
             "search_mode": search_mode,
             "sort_by": sort_by,
             "include_related": include_related,
-        },
+        }.items()
+        if value is not None
+    }
+    payload = await asyncio.to_thread(
+        _post,
+        "/internal/memory/recall",
+        body,
     )
     from cli_agent_orchestrator.models.memory import Memory
 
@@ -175,6 +180,16 @@ def memory_context_for_terminal(terminal_id: str, task_description: str = "") ->
             terminal_id,
             task_description=task_description,
         )
+    # The operator's local kill switch binds the remote owner too (#1071). This
+    # is the single choke point for all five callers of this function
+    # (terminal_service.inject_memory_context, frozen_run_memory._resolve_live,
+    # and the claude_code/codex/kiro_cli memory plugins' post_create_terminal
+    # hooks), so checking here rather than in each caller closes the gap for
+    # all of them at once instead of relying on every caller to remember to.
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return ""
     terminal_context = service._get_terminal_context(terminal_id)
     if not terminal_context:
         return ""

@@ -45,6 +45,7 @@ the gate exists to HALT on, so the requirement is stricter here than anywhere el
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -66,10 +67,20 @@ from cli_agent_orchestrator.models.workflow import (
     WorkflowStep,
 )
 from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
-from cli_agent_orchestrator.services import step_replay, workflow_journal, workflow_service
+from cli_agent_orchestrator.services import (
+    launch_guard,
+    settings_service,
+    step_replay,
+    workflow_journal,
+    workflow_service,
+)
 from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
-from cli_agent_orchestrator.services.step_result import serialise_envelope
+from cli_agent_orchestrator.services.step_result import (
+    build_envelope,
+    parse_envelope,
+    serialise_envelope,
+)
 
 # Captured at import, before any fixture can patch it — see the services file's rationale.
 _PRODUCTION_DATABASE_FILE = Path(constants.DATABASE_FILE)
@@ -170,10 +181,22 @@ def _register_script_run(run_id: str, *, generation: str = "1") -> ScriptRunReco
     Both are needed: the journal row is what the generation fence reads, and the live record
     is the run-step route's script-tier discriminator.
     """
+    spec_snapshot = json.dumps(
+        {
+            "source": "",
+            "launch_guard": {
+                "scheme": launch_guard.GUARD_SCHEME,
+                "profiles": {
+                    "developer": launch_guard._profile_digest("developer"),
+                },
+                "memory_enabled": settings_service.is_memory_enabled(),
+            },
+        }
+    )
     workflow_journal.insert_run(
         run_id=run_id,
         workflow_name="wf",
-        spec_snapshot="steps: []",
+        spec_snapshot=spec_snapshot,
         inputs_json="{}",
         state="running",
         started_at=TS,
@@ -524,9 +547,15 @@ class TestSequentialYamlWorkflowsKeepWorking:
     @pytest.mark.asyncio
     async def test_the_durable_journal_of_a_yaml_run_is_unchanged_in_shape(self, _isolated_journal):
         """The write-through half of "keep working": the run and its steps settle exactly as
-        they did before #583, and the two columns this issue added stay NULL — the YAML tier
-        writes neither, so a row that suddenly carried a fingerprint would mean the script
-        tier's writers had leaked into it."""
+        they did before #583, and no step row carries a call fingerprint. The YAML tier
+        writes none, so a row that suddenly carried one would mean the script tier's writers
+        had leaked into it, and only a fingerprinted row can ever replay.
+
+        ``result_json`` is the YAML tier's OWN write since the run view: each settled step
+        stores its final answer there for the Output tab, through ``build_envelope``. That
+        cannot make the row replayable: with no fingerprint, ``step_replay.decide`` halts
+        before it would serve an envelope, and the run-step route consults the gate for
+        script-tier runs only (``test_the_yaml_drive_never_calls_the_gate...`` below)."""
         _assert_tmp_db(_isolated_journal)
         spy = _ProviderSpy()
         with _terminal_layer(spy):
@@ -543,7 +572,10 @@ class TestSequentialYamlWorkflowsKeepWorking:
             assert row.state == StepState.COMPLETED.value
             assert row.attempts == 1
             assert row.call_fingerprint is None
-            assert row.result_json is None
+            assert row.terminal_id == "rvg-fresh-terminal"
+            assert parse_envelope(row.result_json) == build_envelope(
+                "a fresh answer", "completed", "rvg-fresh-terminal"
+            )
 
     @pytest.mark.asyncio
     async def test_the_yaml_drive_never_calls_the_gate_and_performs_no_replay_read(

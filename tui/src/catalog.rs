@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **95 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **112 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,7 +64,7 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **95 as of this merged branch.** Successive changes brought relationship, workflow, approval,
+/// **112 as of this merged branch.** Successive changes brought relationship, workflow, approval,
 /// agent-orchestration, vault-maintenance, fleet, and worker leaves that this table did not know
 /// about. They were caught by `test/test_command_catalog_matches_click.py` rather than by review,
 /// several only in CI,
@@ -79,7 +79,7 @@ use std::vec::Vec;
 /// notice — the count moves by one and every other number in the file stays plausible.
 ///
 /// `cao workflow step` (issue #640) is another command this guard caught before review did. It is
-/// HIDE.
+/// HIDE. PR #699 adds `workflow create` and `workflow update`; both are also HIDE.
 ///
 /// The four `cao workflow *` leaves — `runs`, `wait`, `result`, `events` — arrived with PR #525
 /// (issue #505, commit `e2e6318`). The four `cao memory relationships *` leaves were added by
@@ -116,7 +116,8 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 95;
+// Local launch-decision controls add fifteen hidden commands.
+const COMMAND_COUNT: usize = 112;
 
 /// What the TUI does with a command.
 ///
@@ -213,7 +214,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 95 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 112 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -235,6 +236,21 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::ConfigList,
     CommandId::ConfigPath,
     CommandId::ConfigSet,
+    CommandId::DecisionsDisable,
+    CommandId::DecisionsEnable,
+    CommandId::DecisionsExclude,
+    CommandId::DecisionsList,
+    CommandId::DecisionsMatchCheck,
+    CommandId::DecisionsMatchExplain,
+    CommandId::DecisionsMatchShow,
+    CommandId::DecisionsOff,
+    CommandId::DecisionsPurge,
+    CommandId::DecisionsSet,
+    CommandId::DecisionsShow,
+    CommandId::DecisionsStatus,
+    CommandId::DecisionsTable,
+    CommandId::DecisionsTier,
+    CommandId::DecisionsTune,
     CommandId::EnvGet,
     CommandId::EnvList,
     CommandId::EnvSet,
@@ -300,6 +316,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkerStatus,
     CommandId::WorkflowApprove,
     CommandId::WorkflowCancel,
+    CommandId::WorkflowCreate,
     CommandId::WorkflowDelete,
     CommandId::WorkflowEvents,
     CommandId::WorkflowGet,
@@ -310,11 +327,12 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowRuns,
     CommandId::WorkflowStatus,
     CommandId::WorkflowStep,
+    CommandId::WorkflowUpdate,
     CommandId::WorkflowWait,
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 95**, the same figure [`COMMAND_COUNT`] pins.
+/// One variant per leaf command — **all 112**, the same figure [`COMMAND_COUNT`] pins.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -324,6 +342,25 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
 /// the crate is built. (#321)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandId {
+    DecisionsOff,
+    DecisionsEnable,
+    DecisionsDisable,
+    DecisionsShow,
+    DecisionsStatus,
+    DecisionsSet,
+    DecisionsTier,
+    DecisionsTable,
+    DecisionsExclude,
+    DecisionsTune,
+    DecisionsList,
+    DecisionsPurge,
+    /// `cao decisions match check` (#1199)
+    DecisionsMatchCheck,
+    /// `cao decisions match explain` (#1199)
+    DecisionsMatchExplain,
+    /// `cao decisions match show` (#1199)
+    DecisionsMatchShow,
+
     // Top-level leaves.
     /// `cao info`
     Info,
@@ -519,6 +556,8 @@ pub enum CommandId {
     WorkflowApprove,
     /// `cao workflow cancel`
     WorkflowCancel,
+    /// `cao workflow create`
+    WorkflowCreate,
     /// `cao workflow delete`
     WorkflowDelete,
     /// `cao workflow events`
@@ -539,6 +578,8 @@ pub enum CommandId {
     WorkflowStatus,
     /// `cao workflow step`
     WorkflowStep,
+    /// `cao workflow update`
+    WorkflowUpdate,
     /// `cao workflow wait`
     WorkflowWait,
     /// `cao workflow validate`
@@ -992,6 +1033,141 @@ fn entry(id: CommandId) -> Command {
                 "no HTTP route: wiki_lint.run_lint is in-process (memory.py:286); OQ-6",
             ),
         },
+        CommandId::DecisionsOff => Command {
+            id: CommandId::DecisionsOff,
+            parent: Some("decisions"),
+            leaf_name: "off",
+            summary: "Halt all points and wait for external requests to finish.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsEnable => Command {
+            id: CommandId::DecisionsEnable,
+            parent: Some("decisions"),
+            leaf_name: "enable",
+            summary: "Run an installed decider's consent command.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsDisable => Command {
+            id: CommandId::DecisionsDisable,
+            parent: Some("decisions"),
+            leaf_name: "disable",
+            summary: "Run an installed decider's revoke command.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsShow => Command {
+            id: CommandId::DecisionsShow,
+            parent: Some("decisions"),
+            leaf_name: "show",
+            summary: "Run an installed decider's status command.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsStatus => Command {
+            id: CommandId::DecisionsStatus,
+            parent: Some("decisions"),
+            leaf_name: "status",
+            summary: "Show effective local settings.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsSet => Command {
+            id: CommandId::DecisionsSet,
+            parent: Some("decisions"),
+            leaf_name: "set",
+            summary: "Set a point's state and optionally its installed decider name.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsTier => Command {
+            id: CommandId::DecisionsTier,
+            parent: Some("decisions"),
+            leaf_name: "tier",
+            summary: "Map a provider tier to a model, or remove its mapping.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsTable => Command {
+            id: CommandId::DecisionsTable,
+            parent: Some("decisions"),
+            leaf_name: "table",
+            summary: "Set the fixed table's profile or role answer.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsExclude => Command {
+            id: CommandId::DecisionsExclude,
+            parent: Some("decisions"),
+            leaf_name: "exclude",
+            summary: "Pin an installed profile to its existing model resolution.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsTune => Command {
+            id: CommandId::DecisionsTune,
+            parent: Some("decisions"),
+            leaf_name: "tune",
+            summary: "Change timeout, confidence threshold or retention.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsList => Command {
+            id: CommandId::DecisionsList,
+            parent: Some("decisions"),
+            leaf_name: "list",
+            summary: "List content-free records, newest first.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsPurge => Command {
+            id: CommandId::DecisionsPurge,
+            parent: Some("decisions"),
+            leaf_name: "purge",
+            summary: "Purge records and optionally invalidate the message hash key.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsMatchShow => Command {
+            id: CommandId::DecisionsMatchShow,
+            parent: Some("decisions match"),
+            leaf_name: "show",
+            summary: "Show the validated catalog, its warnings and its hash.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsMatchCheck => Command {
+            id: CommandId::DecisionsMatchCheck,
+            parent: Some("decisions match"),
+            leaf_name: "check",
+            summary: "Check the catalog against model_tiers.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsMatchExplain => Command {
+            id: CommandId::DecisionsMatchExplain,
+            parent: Some("decisions match"),
+            leaf_name: "explain",
+            summary: "Show the candidates and the pick, asking no one.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
         CommandId::MemoryList => Command {
             id: CommandId::MemoryList,
             parent: Some("memory"),
@@ -1154,16 +1330,16 @@ fn entry(id: CommandId) -> Command {
         },
 
         // ── `cao plugin *` — Agent Plugins 1.0.0 ──────────────────────────────────────────
-        // HIDE for the whole group, deliberately. The verb itself is unresolved maintainer
-        // decision M1, and requirements.md 16.5 forbids shipping this surface to end users
-        // before it is settled — a TUI entry is exactly such a surface. `Handoff` would not
+        // HIDE for the whole group, deliberately. The surface does not ship to end users
+        // until it graduates (#1244); the verb is decision M1, recorded by the issue author
+        // in #573. A TUI entry is exactly such a surface. `Handoff` would not
         // satisfy that: per `Policy`'s own contract a HANDOFF row *is* offered in the TUI and
         // drives the terminal, so it ships the surface just as much as IN-APP does. Only
         // `Hidden` is "not offered at all", and FR-4.3 requires hidden commands be absent from
         // navigation rather than greyed out, which is the gate 16.5 actually asks for. This
         // mirrors `hidden=True` on the Click group.
         //
-        // Two further reasons keep these rows off IN-APP once M1 lands, so the reclassification
+        // Two further reasons keep these rows off IN-APP once it graduates, so the reclassification
         // then is HIDE → HANDOFF and not HIDE → IN-APP: `remove` must warn about live sessions
         // and wait for confirmation before it deletes anything, which a single captured
         // request/response cannot express; and `POST /plugins` runs untrusted content, whose
@@ -1507,6 +1683,39 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "plan_id", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
         },
+        CommandId::WorkflowCreate => Command {
+            id: CommandId::WorkflowCreate,
+            parent: Some("workflow"),
+            leaf_name: "create",
+            summary: "Create a new Python workflow spec from a source file.",
+            // Hidden per the mandated default for an unclassified command. The authoring sequence
+            // defines a deliberate describe, author, validate, approve, and run flow; a pane entry
+            // offered before that interaction is reviewed would guess at a security-sensitive UI.
+            // (#583 Bolt 3, authoring-cli-verbs)
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "name", required: true, kind: ParamKind::Text },
+                Param { name: "from_file", required: true, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowUpdate => Command {
+            id: CommandId::WorkflowUpdate,
+            parent: Some("workflow"),
+            leaf_name: "update",
+            summary: "Replace an existing workflow spec's source, refusing a stale update.",
+            // Hidden for the same reason as `create`, and because update requires an
+            // `--expected-hash` obtained before editing. Fetching it automatically at submission
+            // time would defeat the stale-update precondition.
+            // (#583 Bolt 3, authoring-cli-verbs)
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "name", required: true, kind: ParamKind::Text },
+                Param { name: "from_file", required: true, kind: ParamKind::Text },
+                Param { name: "expected_hash", required: true, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
         CommandId::WorkflowCancel => Command {
             id: CommandId::WorkflowCancel,
             parent: Some("workflow"),
@@ -1736,7 +1945,7 @@ mod tests {
     ///
     /// Returns `(in_app, handoff, hidden)`. The counts are *derived*; every number they are
     /// compared against is a hard-coded literal in the test body. That direction matters — see
-    /// [`the_policy_distribution_is_twentyfour_eighteen_fiftythree`].
+    /// [`the_policy_distribution_is_twentyfour_eighteen_seventy`].
     fn distribution() -> (usize, usize, usize) {
         let mut counts = (0, 0, 0);
         for id in DISPLAY_ORDER {
@@ -1749,7 +1958,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 53 HIDE, totalling 95.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 70 HIDE, totalling 112.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1758,7 +1967,7 @@ mod tests {
     /// would look like if it had it.
     ///
     /// **Four assertions rather than one summed check**, also deliberately: a single
-    /// `in_app + handoff + hidden == 95` stays green when a command moves from IN-APP to HIDE,
+    /// `in_app + handoff + hidden == 112` stays green when a command moves from IN-APP to HIDE,
     /// because the total is conserved. Reclassification is exactly the change most likely to
     /// happen by accident, so each policy is pinned separately and the failure names *which* one
     /// moved.
@@ -1811,29 +2020,32 @@ mod tests {
     /// row is offered in navigation and drives the terminal, so it ships the surface — and
     /// only HIDE is "not offered at all" (FR-4.3). When the gate opens these become HANDOFF,
     /// not IN-APP, because `remove` needs a warn-then-confirm exchange that a captured
-    /// one-shot request cannot carry. On top of the 91 above that gives **24/18/53 = 95**.
+    /// one-shot request cannot carry. The twelve `cao decisions` leaves are also HIDE because
+    /// they are local operator controls, and so are the three `cao decisions match` leaves
+    /// {show, check, explain} that #1199 added: they read the local model catalog in-process,
+    /// with no HTTP route. With these additions, the distribution is **24/18/70 = 112**.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_fiftythree() {
+    fn the_policy_distribution_is_twentyfour_eighteen_seventy() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 53, "expected 53 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 70, "expected 70 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            95,
-            "the three policy counts must account for all 95 leaf commands of the Click tree"
+            112,
+            "the three policy counts must account for all 112 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 95 does not prove 91 *distinct* commands were counted: a
+        // The three counts summing to 112 does not prove 112 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            95,
-            "DISPLAY_ORDER must list 95 DISTINCT commands; a duplicate would let one command go \
+            112,
+            "DISPLAY_ORDER must list 112 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1853,9 +2065,9 @@ mod tests {
     /// production. "The compiler has my back" is exactly where a contributor stops checking, so
     /// the uncovered case needs a test rather than a caveat in a doc comment.
     ///
-    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_fiftythree`]
+    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_seventy`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 95` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 112` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1900,6 +2112,22 @@ mod tests {
             #[allow(clippy::needless_match)]
             fn identity(id: CommandId) -> CommandId {
                 match id {
+                    CommandId::DecisionsOff => CommandId::DecisionsOff,
+                    CommandId::DecisionsEnable => CommandId::DecisionsEnable,
+                    CommandId::DecisionsDisable => CommandId::DecisionsDisable,
+                    CommandId::DecisionsShow => CommandId::DecisionsShow,
+                    CommandId::DecisionsStatus => CommandId::DecisionsStatus,
+                    CommandId::DecisionsSet => CommandId::DecisionsSet,
+                    CommandId::DecisionsTier => CommandId::DecisionsTier,
+                    CommandId::DecisionsTable => CommandId::DecisionsTable,
+                    CommandId::DecisionsExclude => CommandId::DecisionsExclude,
+                    CommandId::DecisionsTune => CommandId::DecisionsTune,
+                    CommandId::DecisionsList => CommandId::DecisionsList,
+                    CommandId::DecisionsPurge => CommandId::DecisionsPurge,
+                    CommandId::DecisionsMatchCheck => CommandId::DecisionsMatchCheck,
+                    CommandId::DecisionsMatchExplain => CommandId::DecisionsMatchExplain,
+                    CommandId::DecisionsMatchShow => CommandId::DecisionsMatchShow,
+
                     CommandId::Info => CommandId::Info,
                     CommandId::Init => CommandId::Init,
                     CommandId::Install => CommandId::Install,
@@ -1983,6 +2211,7 @@ mod tests {
                     CommandId::WorkerStatus => CommandId::WorkerStatus,
                     CommandId::WorkflowApprove => CommandId::WorkflowApprove,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
+                    CommandId::WorkflowCreate => CommandId::WorkflowCreate,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
                     CommandId::WorkflowEvents => CommandId::WorkflowEvents,
                     CommandId::WorkflowGet => CommandId::WorkflowGet,
@@ -1993,6 +2222,7 @@ mod tests {
                     CommandId::WorkflowRuns => CommandId::WorkflowRuns,
                     CommandId::WorkflowStep => CommandId::WorkflowStep,
                     CommandId::WorkflowStatus => CommandId::WorkflowStatus,
+                    CommandId::WorkflowUpdate => CommandId::WorkflowUpdate,
                     CommandId::WorkflowWait => CommandId::WorkflowWait,
                     CommandId::WorkflowValidate => CommandId::WorkflowValidate,
                 }
@@ -2000,6 +2230,21 @@ mod tests {
 
             // Every variant, each passed through the exhaustive map above.
             [
+                CommandId::DecisionsOff,
+                CommandId::DecisionsEnable,
+                CommandId::DecisionsDisable,
+                CommandId::DecisionsShow,
+                CommandId::DecisionsStatus,
+                CommandId::DecisionsSet,
+                CommandId::DecisionsTier,
+                CommandId::DecisionsTable,
+                CommandId::DecisionsExclude,
+                CommandId::DecisionsTune,
+                CommandId::DecisionsList,
+                CommandId::DecisionsPurge,
+                CommandId::DecisionsMatchCheck,
+                CommandId::DecisionsMatchExplain,
+                CommandId::DecisionsMatchShow,
                 CommandId::Info,
                 CommandId::Init,
                 CommandId::Install,
@@ -2083,6 +2328,7 @@ mod tests {
                 CommandId::WorkerStatus,
                 CommandId::WorkflowApprove,
                 CommandId::WorkflowCancel,
+                CommandId::WorkflowCreate,
                 CommandId::WorkflowDelete,
                 CommandId::WorkflowEvents,
                 CommandId::WorkflowGet,
@@ -2093,6 +2339,7 @@ mod tests {
                 CommandId::WorkflowRuns,
                 CommandId::WorkflowStatus,
                 CommandId::WorkflowStep,
+                CommandId::WorkflowUpdate,
                 CommandId::WorkflowWait,
                 CommandId::WorkflowValidate,
             ]
@@ -2155,7 +2402,7 @@ mod tests {
             42,
             "commands() must offer the 24 IN-APP plus 18 HANDOFF commands and nothing else; an \
              empty or short list would satisfy the Hidden check below while offering nothing. The \
-             four `cao plugin *` rows are HIDE pending maintainer decision M1, so they are \
+             four `cao plugin *` rows are HIDE pending graduation (#1244), so they are \
              deliberately absent from navigation (requirements.md 16.5, FR-4.3)"
         );
 
@@ -2246,7 +2493,7 @@ mod tests {
             ],
             "expected exactly these 18 HANDOFF commands; without this assertion the loop above \
              passes vacuously when zero entries are HANDOFF. `cao plugin *` is deliberately NOT \
-             here: those four rows are HIDE until maintainer decision M1 settles the verb"
+             here: those four rows are HIDE until the surface graduates (#1244)"
         );
     }
 

@@ -5,17 +5,15 @@ Covers:
 - EventEncoder framing (data:-only camelCase with type field)
 - Interrupt outcome emission
 - Resume round-trip via run plane
-- Uncovered/expired interrupt -> RUN_ERROR
+- Unknown/expired resume entry -> skipped with a warning, run proceeds
 - 501 behaviour when ag-ui-protocol is absent (mocked)
 - Lifecycle legality (RUN_STARTED first, RUN_FINISHED/ERROR last)
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -23,7 +21,6 @@ from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     AgentHandoffWithApproval,
     ApprovalDecision,
-    Interrupt,
 )
 
 # ---------------------------------------------------------------------------
@@ -311,12 +308,12 @@ async def test_run_plane_resume_edit():
     emitter = RecordingUiEmitter()
     construct = AgentHandoffWithApproval(emitter=emitter, answer_delivery=None)
 
-    # Use a prompt that results in options including "edit"
-    # (permission_request includes ["approve", "deny", "edit"])
+    # Use a prompt whose options include "edit" (kiro permission_request).
+    # Claude Code permission prompts do not offer edit.
     interrupt = construct.on_provider_waiting(
         terminal_id="t-1",
-        provider="claude_code",
-        raw_prompt="\u2191/\u2193 to navigate",
+        provider="kiro_cli",
+        raw_prompt="Allow this action? [y/n/t]:",
         session_name="s-1",
     )
 
@@ -375,7 +372,7 @@ async def test_run_plane_resume_cancelled_maps_to_deny():
             approval_construct=construct,
         )
     )
-    parsed = _parse_frames(frames)
+    _parsed = _parse_frames(frames)
 
     assert construct.get_interrupt(interrupt.id).resolved
     assert construct.get_interrupt(interrupt.id).outcome == "deny"
@@ -388,7 +385,7 @@ async def test_run_plane_resume_cancelled_maps_to_deny():
 
 @pytest.mark.asyncio
 async def test_run_plane_resume_unknown_interrupt():
-    """resume[] referencing unknown interrupt produces RUN_ERROR."""
+    """resume[] referencing an unknown interrupt is skipped; the run finishes (#1191)."""
     from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
 
     emitter = RecordingUiEmitter()
@@ -412,9 +409,8 @@ async def test_run_plane_resume_unknown_interrupt():
     )
     parsed = _parse_frames(frames)
 
-    assert parsed[0]["type"] == "RUN_STARTED"
-    assert parsed[1]["type"] == "RUN_ERROR"
-    assert "nonexistent-id" in parsed[1]["message"]
+    assert [p["type"] for p in parsed] == ["RUN_STARTED", "RUN_FINISHED"]
+    assert parsed[1]["outcome"] == {"type": "success"}
 
 
 @pytest.mark.asyncio

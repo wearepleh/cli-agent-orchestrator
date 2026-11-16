@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     IdempotencyKeyModel,
     InboxModel,
@@ -26,44 +28,128 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 logger = logging.getLogger(__name__)
 
 
+def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
+    """Is the agent behind this aged-out registry row still running? (#708)
+
+    Retention selects rows on ``last_active``, which is written ONLY on input
+    delivery (``send_input`` / ``send_special_key``), so a perfectly healthy
+    agent that nobody has messaged for ``RETENTION_DAYS`` is indistinguishable
+    by that column from an abandoned one. Deleting its row does not stop it --
+    ``delete_terminal_row`` drops the registry record without killing the tmux
+    window or the provider process -- but it does make it permanently
+    UNADDRESSABLE: ``create_inbox_message`` rejects a receiver with no row, and
+    ``list_pending_receiver_ids_older_than`` inner-joins ``terminals``, so every
+    message already PENDING for that receiver silently leaves the
+    reconciliation sweep forever while still reporting PENDING.
+
+    Fails CLOSED. ``cleanup_terminal_exact(..., close=False)`` proves identity
+    from the terminal's own ``@cao_terminal_id`` option rather than its
+    (reusable) session/window name, and only ``ABSENT`` -- positive proof no
+    live object carries this id -- is read as "gone". Both ``STILL_PRESENT``
+    and ``UNKNOWN`` (an unreadable listing, an ambiguous identity, or any
+    other unanswerable lookup) are treated as live and retained, because a
+    wrong "gone" is irreversible and silent whereas a wrong "live" only
+    defers the row's deletion to the next sweep.
+    """
+    backend = get_backend()
+    terminal_id = str(terminal.id)
+    session_name = str(terminal.tmux_session)
+    window_name = str(terminal.tmux_window)
+    try:
+        result = backend.cleanup_terminal_exact(terminal_id, session_name, window_name, close=False)
+    except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
+            session_name,
+            window_name,
+            exc,
+        )
+        return True
+
+    if result.outcome == TerminalCleanupOutcome.ABSENT:
+        return False
+    if result.outcome == TerminalCleanupOutcome.UNKNOWN:
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
+            session_name,
+            window_name,
+            result.detail,
+        )
+    return True
+
+
 def cleanup_old_data():
     """Clean up terminals, inbox messages, and log files older than RETENTION_DAYS."""
     try:
-        cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
         logger.info(
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
 
-        # Clean up old terminals (stop FIFO readers and clear state first)
+        # Clean up old terminals. Deferred-init external-owner/failure rows are
+        # lifecycle tombstones: age alone must never erase failure truth before
+        # the external owner acknowledges it. Ordinary stale rows keep the
+        # historical FIFO/status/Grok cleanup posture, but row deletion now
+        # flows through terminal_service.delete_terminal_row so lifecycle
+        # sidecars are removed atomically with the registry record instead of
+        # being orphaned by a bulk SQL DELETE.
         with SessionLocal() as db:
-            old_terminals = (
+            old_terminals = list(
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
-            retained_terminal_ids: set[str] = set()
-            for terminal in old_terminals:
-                fifo_manager.stop_reader(terminal.id)
-                status_monitor.clear_terminal(terminal.id)
-                # A stale Grok terminal can still own a private GROK_HOME. An
-                # explicit deferred cleanup is its retry handle, so retention
-                # housekeeping must not bulk-delete that row underneath it.
-                if (
-                    terminal.provider == ProviderType.GROK_CLI.value
-                    and provider_manager.cleanup_provider(terminal.id) is False
-                ):
-                    retained_terminal_ids.add(terminal.id)
-                    logger.warning(
-                        "Retaining stale Grok terminal %s while cleanup is deferred",
-                        terminal.id,
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        deleted_terminals = 0
+        for terminal in old_terminals:
+            terminal_id = str(terminal.id)
+            try:
+                if terminal_service.should_retain_deferred_failure_tombstone(terminal_id):
+                    logger.info(
+                        "Retaining old deferred-init terminal %s until external-owner cleanup",
+                        terminal_id,
                     )
-            terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
-            if retained_terminal_ids:
-                deleted_terminals = terminal_query.filter(
-                    ~TerminalModel.id.in_(retained_terminal_ids)
-                ).delete()
-            else:
-                deleted_terminals = terminal_query.delete()
-            db.commit()
-            logger.info(f"Deleted {deleted_terminals} old terminals from database")
+                    continue
+            except Exception as exc:  # noqa: BLE001 — uncertain ownership fails closed
+                logger.warning(
+                    "Could not establish deferred-init ownership for stale terminal %s; "
+                    "retaining it: %s",
+                    terminal_id,
+                    exc,
+                )
+                continue
+
+            # Age is not death (#708). A live agent's row is the only thing
+            # that makes it addressable, so never age one out.
+            if stale_terminal_runtime_is_live(terminal):
+                logger.info(
+                    "Retaining aged-out terminal %s: its runtime is still live", terminal_id
+                )
+                continue
+
+            fifo_manager.stop_reader(terminal_id)
+            status_monitor.clear_terminal(terminal_id)
+            if (
+                terminal.provider == ProviderType.GROK_CLI.value
+                and provider_manager.cleanup_provider(terminal_id) is False
+            ):
+                logger.warning(
+                    "Retaining stale Grok terminal %s while cleanup is deferred", terminal_id
+                )
+                continue
+
+            try:
+                metadata = terminal_service.get_terminal_metadata(terminal_id)
+                if terminal_service.delete_terminal_row(
+                    terminal_id, metadata, registry=None, end_reason="stale_cleanup"
+                ):
+                    deleted_terminals += 1
+            except Exception as exc:  # noqa: BLE001 — retention sweep is best-effort
+                logger.warning("Failed to delete stale terminal %s: %s", terminal_id, exc)
+
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
         # Clean up old inbox messages
         with SessionLocal() as db:
@@ -82,6 +168,16 @@ def cleanup_old_data():
                 .filter(IdempotencyKeyModel.created_at < cutoff_date)
                 .delete()
             )
+            from cli_agent_orchestrator.decisions.settings import load_settings
+            from cli_agent_orchestrator.decisions.store import DecisionStore
+
+            try:
+                decision_cutoff = datetime.now(timezone.utc) - timedelta(
+                    days=load_settings().retention_days
+                )
+                DecisionStore(sessions=SessionLocal).purge(before=decision_cutoff, session=db)
+            except Exception:
+                logger.warning("Failed to clean up old decision records")
             db.commit()
             logger.info(f"Deleted {deleted_keys} old idempotency keys from database")
 
@@ -105,17 +201,7 @@ def cleanup_old_data():
         logger.info(f"Deleted {server_logs_deleted} old server log files")
 
         # Clean up old handoff result records (issue #447).
-        # Same RETENTION_DAYS window as terminals/messages, but a UTC cutoff, NOT
-        # ``cutoff_date`` (PR #453 review finding 1). The three tables above default
-        # their timestamp to naive-local ``datetime.now``, so the naive-local
-        # ``cutoff_date`` matches them. ``HandoffResultModel.created_at`` defaults to
-        # ``_utcnow()`` instead, and SQLite drops the offset -- what lands in the
-        # column is UTC wall-clock. Comparing that to a local cutoff deletes rows
-        # UTC-offset hours early (east of UTC) or late (west); measured ~10-19h early
-        # under TZ=+10. This is the most sensitive swept table (it holds full worker
-        # output), so it gets the clock its WRITER uses rather than the one its
-        # neighbours use.
-        handoff_cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+        handoff_cutoff = cutoff_date
         try:
             deleted_handoff = delete_old_handoff_results(handoff_cutoff)
             logger.info(f"Deleted {deleted_handoff} old handoff result records")

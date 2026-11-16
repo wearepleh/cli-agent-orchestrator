@@ -15,6 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.backends import registry as backend_registry
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome, TerminalCleanupResult
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -149,6 +150,67 @@ class TestCreateSession:
         assert mock_create_terminal.call_args.kwargs["idempotency_key"] == "retry-1"
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_lookup_only_is_forwarded_and_publishes_no_creation_event(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        """Review on PR #773: a lookup resolves an existing terminal, so it
+        must not publish post_create_session a second time."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        result = await create_session(
+            provider="kiro_cli",
+            agent_profile="my_agent",
+            idempotency_key="retry-1",
+            lookup_only=True,
+        )
+
+        assert result is mock_terminal
+        assert mock_create_terminal.call_args.kwargs["lookup_only"] is True
+        mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.session_service.last_create_was_replay",
+        return_value=True,
+    )
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_keyed_replay_publishes_no_second_creation_event(
+        self, mock_create_terminal, mock_dispatch, _was_replay
+    ):
+        """A retry that replays an earlier create returns the same terminal;
+        the event log must not record a second launch for that session."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        result = await create_session(
+            provider="kiro_cli", agent_profile="my_agent", idempotency_key="retry-1"
+        )
+
+        assert result is mock_terminal
+        mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_ordinary_create_still_publishes_the_creation_event(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(provider="kiro_cli", agent_profile="my_agent")
+
+        assert "lookup_only" not in mock_create_terminal.call_args.kwargs
+        assert mock_dispatch.call_args.args[1] == "post_create_session"
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
     async def test_create_session_rejects_orchestration_type_without_message(
         self, mock_create_terminal
@@ -234,6 +296,28 @@ class TestListSessions:
         assert all("working_directory" in s for s in result)
         assert all("agent_profile" in s for s in result)
 
+    @patch("cli_agent_orchestrator.services.session_service.get_session_labels")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_attaches_display_label(
+        self, mock_get_backend, mock_list_in_sessions, mock_labels
+    ):
+        """Every listed session carries ``label``: the operator alias, or None."""
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-session1", "name": "Session 1"},
+            {"id": "cao-session2", "name": "Session 2"},
+        ]
+        mock_list_in_sessions.return_value = []
+        mock_labels.return_value = {"cao-session1": "Nightly triage"}
+
+        result = list_sessions()
+
+        by_id = {s["id"]: s for s in result}
+        assert by_id["cao-session1"]["label"] == "Nightly triage"
+        assert by_id["cao-session2"]["label"] is None
+        # One settings read for the whole listing, not one per session.
+        mock_labels.assert_called_once()
+
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_empty(self, mock_get_backend):
         """Test listing sessions when none exist."""
@@ -296,6 +380,7 @@ class TestListSessions:
                 "status": "detached",
                 "agent_profile": "developer",
                 "working_directory": "/launch/project",
+                "label": None,
             }
         ]
         assert fake_client.cwd_calls == []
@@ -435,6 +520,7 @@ class TestListSessions:
                 "name": "Good",
                 "working_directory": None,
                 "agent_profile": None,
+                "label": None,
             }
         ]
 
@@ -694,6 +780,131 @@ class TestListSessions:
         assert _swallowed_log(caplog, "Failed to list sessions").exc_info
 
 
+class TestStaleLabelIsNotInheritedByANewSession:
+    """haofeif, PR #1036 review, P3-2 (+1 plauzy): labels are keyed by session
+    NAME in settings.json and outlive the server, but only ``delete_session``
+    and an explicit empty-label POST removed one. A session that ends any other
+    way -- ``delete_terminal`` killing the last window, a flow run recycling its
+    session, the herdr reconcile, a tmux or host restart -- left its label
+    behind, and the next session created with that name showed it.
+
+    The locked ``new_session`` branch of ``create_terminal`` already wiped the
+    name's stale forwarded-env mapping; it now wipes the label in the same
+    place, through ``_clear_stale_session_state``.
+    """
+
+    @pytest.fixture
+    def create_harness(self, kiro_agent_store_not_under_test):
+        """``create_terminal`` with a mocked backend, stopped at the tmux create.
+
+        The clear runs before the backend is asked for anything, so raising
+        there proves the clear happened without standing up tmux or a provider.
+        Same seams as ``test_working_directory_point_of_use.py``, including the
+        opt-out of the Kiro agent-store check (#1074): ``kiro_cli`` is a
+        stand-in here and "developer" is not an installed Kiro agent.
+        """
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        ts = "cli_agent_orchestrator.services.terminal_service"
+        with (
+            patch(f"{ts}.db_delete_terminal"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+            patch(f"{ts}.generate_window_name", return_value="developer-abcd"),
+            patch(f"{ts}.generate_terminal_id", return_value="test1234"),
+            patch(f"{ts}.agent_profiles.load_agent_profile") as load_profile,
+        ):
+            load_profile.return_value = AgentProfile(name="developer", description="Developer")
+            backend.session_exists.return_value = False
+            backend.create_session.side_effect = RuntimeError("stop at the tmux create")
+            yield backend
+
+    @pytest.mark.asyncio
+    async def test_a_label_left_by_a_session_that_died_is_cleared_at_create(
+        self, create_harness, real_session_db
+    ):
+        from cli_agent_orchestrator.services.settings_service import (
+            get_session_labels,
+            set_session_label,
+        )
+
+        # An operator labels cao-review, then the host restarts: tmux loses the
+        # session, delete_session never runs, and the label stays on disk.
+        set_session_label("cao-review", "Nightly triage")
+        assert get_session_labels() == {"cao-review": "Nightly triage"}
+
+        with pytest.raises(RuntimeError, match="stop at the tmux create"):
+            await terminal_service.create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-review",
+                new_session=True,
+            )
+
+        assert get_session_labels() == {}
+        # ...so the listing an operator actually reads shows no label. GET
+        # /sessions is this function plus serialization.
+        with (
+            patch("cli_agent_orchestrator.services.session_service.get_backend") as get_backend,
+            patch(
+                "cli_agent_orchestrator.services.session_service.list_terminals_in_sessions",
+                return_value=[],
+            ),
+        ):
+            get_backend.return_value.list_sessions.return_value = [
+                {"id": "cao-review", "name": "cao-review"}
+            ]
+            listed = list_sessions()
+        assert [s["label"] for s in listed] == [None]
+
+    @pytest.mark.asyncio
+    async def test_joining_an_existing_session_keeps_its_label(
+        self, create_harness, real_session_db
+    ):
+        """The clear belongs to the new-session branch only: adding a window to
+        a live session must not wipe the label its operator set."""
+        from cli_agent_orchestrator.services.settings_service import (
+            get_session_labels,
+            set_session_label,
+        )
+
+        set_session_label("cao-review", "Nightly triage")
+        create_harness.session_exists.return_value = True
+        create_harness.create_window.side_effect = RuntimeError("stop at the tmux create")
+
+        with pytest.raises(RuntimeError, match="stop at the tmux create"):
+            await terminal_service.create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-review",
+                new_session=False,
+            )
+
+        assert get_session_labels() == {"cao-review": "Nightly triage"}
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_settings_file_is_a_warning_not_a_failed_create(
+        self, create_harness, real_session_db, caplog
+    ):
+        """Teardown's judgement, applied here (plauzy, #724 review, item 4):
+        nothing was written and nothing was lost, so refusing to launch the
+        session over it would be the worse outcome."""
+        from cli_agent_orchestrator.services import settings_service
+
+        settings_service.SETTINGS_FILE.mkdir()  # the autouse fixture points this at tmp_path
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RuntimeError, match="stop at the tmux create"):
+                await terminal_service.create_terminal(
+                    "kiro_cli",
+                    "developer",
+                    session_name="cao-review",
+                    new_session=True,
+                )
+
+        assert "Not clearing a stale label for cao-review" in caplog.text
+        assert settings_service.SETTINGS_FILE.is_dir()
+
+
 @pytest.fixture
 def real_session_db(tmp_path, monkeypatch):
     """Route terminal metadata to a per-test real SQLite database."""
@@ -861,6 +1072,64 @@ class TestSessionOwnershipIntegration:
                     delete_session(second.session_name)
 
 
+@pytest.fixture
+def pending_inbox_counts():
+    with patch.object(session_service_mod, "get_pending_inbox_counts", return_value={}) as counts:
+        yield counts
+
+
+@pytest.mark.usefixtures("pending_inbox_counts")
+class TestGetSessionMasksPendingDelivery:
+    """#566: the masking WIRING here, not just ``reported_status`` in isolation.
+
+    ``TestReportedStatusMasking`` pins the function; nothing pinned that
+    ``get_session`` actually calls it. Deleting the call left 162 tests passing
+    (gutosantos82's mutation check), so the whole invariant -- a terminal whose
+    accepted initial message is undelivered must never read completable anywhere a
+    client can see it -- rested on an unguarded call site. ``GET /sessions/{name}``
+    is one of the three outward surfaces, reached by ``examples/fleet/panel`` and
+    by ``ops_mcp_server.get_session_info``.
+    """
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_pending_delivery_is_masked_in_the_session_listing(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.services import terminal_service
+
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-test", "name": "Test Session"}
+        ]
+        mock_list_terminals.return_value = [
+            {"id": "pend1234", "session": "cao-test"},
+            {"id": "free5678", "session": "cao-test"},
+        ]
+
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        # Only pend1234 has an undelivered initial message.
+        with (
+            patch.object(terminal_service, "_pending_initial_delivery", {"pend1234"}),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", fake_monitor),
+        ):
+            result = get_session("cao-test")
+
+        by_id = {term["id"]: term["status"] for term in result["terminals"]}
+        assert by_id["pend1234"] == TerminalStatus.UNKNOWN.value, (
+            "get_session reported a completable status for a terminal whose initial "
+            "message has not been dispatched -- the mask is not wired into this surface, "
+            "so a client polling GET /sessions/{name} can still conclude 'done'"
+        )
+        assert (
+            by_id["free5678"] == TerminalStatus.IDLE.value
+        ), "masking leaked to a terminal with no pending delivery; it is per-terminal"
+
+
+@pytest.mark.usefixtures("pending_inbox_counts")
 class TestGetSession:
     """Tests for get_session function."""
 
@@ -879,6 +1148,22 @@ class TestGetSession:
         assert result["session"]["id"] == "cao-test"
         assert len(result["terminals"]) == 1
         mock_get_backend.return_value.session_exists.assert_called_once_with("cao-test")
+
+    @patch("cli_agent_orchestrator.services.session_service.get_session_labels")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_attaches_display_label(
+        self, mock_get_backend, mock_list_terminals, mock_labels
+    ):
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
+        mock_list_terminals.return_value = []
+        mock_labels.return_value = {"cao-test": "Nightly triage"}
+
+        assert get_session("cao-test")["session"]["label"] == "Nightly triage"
+
+        mock_labels.return_value = {}
+        assert get_session("cao-test")["session"]["label"] is None
 
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
@@ -906,6 +1191,251 @@ class TestGetSession:
         assert result["terminals"][0]["status"] == "processing"
         assert result["terminals"][1]["status"] == "completed"
 
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_prefers_durable_deferred_failure_over_live_status(
+        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
+        mock_list_terminals.return_value = [
+            {
+                "id": "term-a",
+                "tmux_session": "cao-test",
+                "deferred_init_failure": {
+                    "phase": "deferred_init",
+                    "kind": "provider_init_error",
+                    "message": "workspace trust required",
+                },
+            }
+        ]
+        mock_failure.return_value = mock_list_terminals.return_value[0]["deferred_init_failure"]
+        mock_get_backend.return_value.cleanup_terminal_exact.return_value = TerminalCleanupResult(
+            TerminalCleanupOutcome.STILL_PRESENT
+        )
+
+        result = get_session("cao-test")
+
+        assert result["terminals"][0]["status"] == "error"
+        assert result["terminals"][0]["deferred_init_failure"]["message"] == (
+            "workspace trust required"
+        )
+        mock_get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_filters_old_failure_tombstone_when_replacement_is_live(
+        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-reused"}]
+        mock_list_terminals.return_value = [
+            {
+                "id": "old-failed",
+                "tmux_session": "cao-reused",
+                "deferred_init_failure": {"message": "trust required"},
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            },
+            {
+                "id": "new-live",
+                "tmux_session": "cao-reused",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-new",
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: (
+            {"message": "trust required"} if terminal_id == "old-failed" else None
+        )
+        mock_get_status.return_value.value = "idle"
+
+        result = get_session("cao-reused")
+
+        assert [terminal["id"] for terminal in result["terminals"]] == ["new-live"]
+        assert result["terminals"][0]["status"] == "idle"
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_keeps_failed_sibling_from_current_incarnation(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_get_status,
+        mock_failure,
+        pending_inbox_counts,
+    ):
+        """A failed worker from the current live incarnation remains visible.
+
+        Before durable incarnation identity, the presence of any healthy row
+        caused get_session() to drop every retained failure sharing the reusable
+        session label, including a sibling that failed inside the SAME session.
+        """
+
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-current"}]
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "worker failed",
+        }
+        mock_list_terminals.return_value = [
+            {
+                "id": "conductor",
+                "tmux_session": "cao-current",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "failed-worker",
+                "tmux_session": "cao-current",
+                "deferred_init_failure": failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "old-failed",
+                "tmux_session": "cao-current",
+                "deferred_init_failure": {"message": "old generation"},
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: {
+            "failed-worker": failure,
+            "old-failed": {"message": "old generation"},
+        }.get(terminal_id)
+        mock_get_status.return_value.value = "idle"
+
+        metadata_before = [dict(t) for t in mock_list_terminals.return_value[:2]]
+        pending_inbox_counts.return_value = {"conductor": 123, "old-failed": 9}
+        result = get_session("cao-current")
+        pending_inbox_counts.assert_called_once_with(["conductor", "failed-worker"])
+        assert [t["pending_inbox_count"] for t in result["terminals"]] == [123, 0]
+        for actual, original in zip(result["terminals"], metadata_before):
+            assert {key: actual[key] for key in original} == original
+
+        assert [terminal["id"] for terminal in result["terminals"]] == [
+            "conductor",
+            "failed-worker",
+        ]
+        assert result["terminals"][0]["status"] == "idle"
+        assert result["terminals"][1]["status"] == "error"
+        assert result["terminals"][1]["deferred_init_failure"] == failure
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_current_session_terminals_filters_old_incarnation(
+        self, mock_get_backend, mock_list_terminals, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        current_failure = {"message": "current worker failed"}
+        mock_list_terminals.return_value = [
+            {
+                "id": "old-failed",
+                "deferred_init_failure": {"message": "old failure"},
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            },
+            {
+                "id": "current-live",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "current-failed",
+                "deferred_init_failure": current_failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-current",
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: {
+            "old-failed": {"message": "old failure"},
+            "current-failed": current_failure,
+        }.get(terminal_id)
+
+        rows = session_service_mod.list_current_session_terminals("cao-reused")
+
+        assert [row["id"] for row in rows] == ["current-live", "current-failed"]
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_current_session_terminals_returns_raw_rows_when_backend_is_absent(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        mock_get_backend.return_value.session_exists_strict.return_value = False
+        raw_rows = [
+            {
+                "id": "old-failed",
+                "deferred_init_failure": {"message": "old failure"},
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            }
+        ]
+        mock_list_terminals.return_value = raw_rows
+
+        rows = session_service_mod.list_current_session_terminals("cao-gone")
+
+        assert rows == raw_rows
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_returns_terminated_tombstone_after_backend_session_is_gone(
+        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = False
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "workspace trust required",
+        }
+        mock_list_terminals.return_value = [
+            {
+                "id": "term-a",
+                "tmux_session": "cao-gone",
+                "deferred_init_failure": failure,
+            }
+        ]
+        mock_failure.return_value = failure
+
+        result = get_session("cao-gone")
+        assert result["terminals"][0]["pending_inbox_count"] == 0
+
+        assert result["session"] == {
+            "id": "cao-gone",
+            "name": "cao-gone",
+            "status": "terminated",
+            "label": None,
+        }
+        assert result["terminals"][0]["status"] == "error"
+        assert result["terminals"][0]["deferred_init_failure"] == failure
+        mock_get_backend.return_value.list_sessions.assert_not_called()
+        mock_get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_missing_backend_without_tombstone_stays_not_found(
+        self, mock_get_backend, mock_list_terminals, mock_failure
+    ):
+        mock_get_backend.return_value.session_exists.return_value = False
+        mock_list_terminals.return_value = [{"id": "term-a", "tmux_session": "cao-gone"}]
+        mock_failure.return_value = None
+
+        with pytest.raises(ValueError, match="Session 'cao-gone' not found"):
+            get_session("cao-gone")
+
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_not_found(self, mock_get_backend):
         """Test getting non-existent session."""
@@ -931,6 +1461,25 @@ class TestGetSession:
         with pytest.raises(Exception, match="Tmux error"):
             get_session("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_empty_session_counts(self, backend, terminals, pending_inbox_counts):
+        backend.return_value.session_exists.return_value = True
+        backend.return_value.list_sessions.return_value = [{"id": "cao-empty"}]
+        terminals.return_value = []
+        assert get_session("cao-empty")["terminals"] == []
+        pending_inbox_counts.assert_called_once_with([])
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_pending_count_failure_propagates(self, backend, terminals, pending_inbox_counts):
+        backend.return_value.session_exists.return_value = True
+        backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
+        terminals.return_value = [{"id": "receiver", "agent_profile": "worker"}]
+        pending_inbox_counts.side_effect = RuntimeError("count query failed")
+        with pytest.raises(RuntimeError, match="count query failed"):
+            get_session("cao-test")
+
 
 class TestDeleteSession:
     """Tests for delete_session function.
@@ -944,6 +1493,17 @@ class TestDeleteSession:
     BY ID to the incarnation it started tearing down. Faithful-fake, real-DB
     reconciliation and concurrency tests live in test_session_teardown_atomic.py.
     """
+
+    @pytest.fixture(autouse=True)
+    def mock_incarnation_backfill(self, monkeypatch):
+        # This class supplies synthetic registry rows through mocks. Real
+        # persistence/backfill and retry behavior are tested with SQLite in
+        # test_session_incarnation.py.
+        monkeypatch.setattr(
+            session_service_mod,
+            "update_terminals_session_incarnation",
+            MagicMock(return_value=True),
+        )
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
@@ -980,7 +1540,9 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         # Registry rows are reconciled after kill_session confirms the session
         # is gone — scoped to the incarnation's ids, not the whole session name.
-        mock_delete_terminals_by_ids.assert_called_once_with(["terminal1", "terminal2"])
+        mock_delete_terminals_by_ids.assert_called_once_with(
+            ["terminal1", "terminal2"], end_reason="session_teardown"
+        )
         # Snapshots are captured while the panes still exist ...
         assert mock_capture.call_count == 2
         mock_capture.assert_any_call("terminal1")
@@ -990,8 +1552,163 @@ class TestDeleteSession:
         mock_dismantle.assert_any_call("terminal1", ANY, kill_window=False)
         mock_dismantle.assert_any_call("terminal2", ANY, kill_window=False)
         assert mock_delete_row.call_count == 2
-        mock_delete_row.assert_any_call("terminal1", ANY, registry=ANY)
-        mock_delete_row.assert_any_call("terminal2", ANY, registry=ANY)
+        mock_delete_row.assert_any_call(
+            "terminal1", ANY, registry=ANY, end_reason="session_teardown"
+        )
+        mock_delete_row.assert_any_call(
+            "terminal2", ANY, registry=ANY, end_reason="session_teardown"
+        )
+
+    @patch("cli_agent_orchestrator.services.session_service.get_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_preserves_old_incarnation_tombstone_when_name_reused(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+        mock_failure,
+    ):
+        """Deleting the live replacement must not erase an older failure tombstone.
+
+        Session names are reusable labels.  Once durable incarnation identity
+        exists, teardown of the CURRENT live session must be scoped to that
+        incarnation, while a retained failure from an older incarnation remains
+        available to its external lifecycle owner.
+        """
+        old_failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "old generation failed",
+        }
+        current_failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "current sibling failed",
+        }
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [
+            {
+                "id": "old-failed",
+                "deferred_init_failure": old_failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-old",
+            },
+            {
+                "id": "current-live",
+                "deferred_init_failure": None,
+                "deferred_init_runtime_reclaimed": False,
+                "session_incarnation_id": "inc-current",
+            },
+            {
+                "id": "current-failed",
+                "deferred_init_failure": current_failure,
+                "deferred_init_runtime_reclaimed": True,
+                "session_incarnation_id": "inc-current",
+            },
+        ]
+        mock_failure.side_effect = lambda terminal_id, candidate=None: {
+            "old-failed": old_failure,
+            "current-failed": current_failure,
+        }.get(terminal_id)
+
+        result = delete_session("cao-reused")
+
+        assert result == {"deleted": ["cao-reused"], "errors": []}
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-reused")
+        assert [call.args[0] for call in mock_capture.call_args_list] == [
+            "current-live",
+            "current-failed",
+        ]
+        assert [call.args[0] for call in mock_dismantle.call_args_list] == [
+            "current-live",
+            "current-failed",
+        ]
+        assert [call.args[0] for call in mock_delete_row.call_args_list] == [
+            "current-live",
+            "current-failed",
+        ]
+        mock_delete_terminals_by_ids.assert_called_once_with(
+            ["current-live", "current-failed"], end_reason="session_teardown"
+        )
+
+    @patch("cli_agent_orchestrator.services.session_service.set_session_label")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_clears_display_label(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+        mock_set_label,
+    ):
+        """A later same-name session must not inherit the alias; and a settings
+        write failure is reported in ``errors``, never raised over the completed
+        teardown."""
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "terminal1"}]
+
+        result = delete_session("cao-test")
+
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        mock_set_label.assert_called_once_with("cao-test", "")
+
+        mock_set_label.side_effect = OSError("disk full")
+        result = delete_session("cao-test")
+        assert result["deleted"] == ["cao-test"]
+        assert [e["step"] for e in result["errors"]] == ["clear_session_label"]
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_completes_cleanly_over_an_unreadable_settings_file(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+        caplog,
+    ):
+        """plauzy, #724 review, item 4: with settings.json as a directory the
+        label clear raised a bare IsADirectoryError, ``delete_session`` filed it
+        under ``errors[]``, and ``DELETE /sessions/{name}`` answered 409
+        "cleanup deferred ... retry after residual Grok processes exit" for a
+        fully completed teardown, on every retry. An unreadable settings file
+        is a warning here: nothing was written, nothing was lost."""
+        from cli_agent_orchestrator.services import settings_service
+
+        settings_service.SETTINGS_FILE.mkdir()  # the autouse fixture points this at tmp_path
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "terminal1"}]
+
+        with caplog.at_level(logging.WARNING):
+            result = delete_session("cao-test")
+
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        assert "Not clearing label for cao-test" in caplog.text
+        assert settings_service.SETTINGS_FILE.is_dir()
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
@@ -1020,8 +1737,12 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_not_called()
         mock_capture.assert_called_once_with("terminal1")
         mock_dismantle.assert_called_once_with("terminal1", ANY, kill_window=False)
-        mock_delete_row.assert_called_once_with("terminal1", ANY, registry=ANY)
-        mock_delete_terminals_by_ids.assert_called_once_with(["terminal1"])
+        mock_delete_row.assert_called_once_with(
+            "terminal1", ANY, registry=ANY, end_reason="session_teardown"
+        )
+        mock_delete_terminals_by_ids.assert_called_once_with(
+            ["terminal1"], end_reason="session_teardown"
+        )
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
@@ -1050,7 +1771,7 @@ class TestDeleteSession:
         mock_capture.assert_not_called()
         mock_dismantle.assert_not_called()
         mock_delete_row.assert_not_called()
-        mock_delete_terminals_by_ids.assert_called_once_with([])
+        mock_delete_terminals_by_ids.assert_called_once_with([], end_reason="session_teardown")
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -1109,10 +1830,12 @@ class TestDeleteSession:
         assert mock_dismantle.call_count == 3
         assert mock_delete_row.call_count == 3
         mock_dismantle.assert_any_call("terminal1", None, kill_window=False)
-        mock_delete_row.assert_any_call("terminal1", None, registry=ANY)
+        mock_delete_row.assert_any_call(
+            "terminal1", None, registry=ANY, end_reason="session_teardown"
+        )
         # The by-id sweep still backstops any row a failed delete left behind.
         mock_delete_terminals_by_ids.assert_called_once_with(
-            ["terminal1", "terminal2", "terminal3"]
+            ["terminal1", "terminal2", "terminal3"], end_reason="session_teardown"
         )
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
@@ -1153,7 +1876,7 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-grok")
         # The retry handle survives both row-deletion paths.
         mock_delete_row.assert_not_called()
-        mock_delete_terminals_by_ids.assert_called_once_with([])
+        mock_delete_terminals_by_ids.assert_called_once_with([], end_reason="session_teardown")
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
@@ -1190,7 +1913,7 @@ class TestDeleteSession:
         for tid in ("term-aaa", "term-bbb", "term-ccc", "term-ddd"):
             mock_capture.assert_any_call(tid)
             mock_dismantle.assert_any_call(tid, ANY, kill_window=False)
-            mock_delete_row.assert_any_call(tid, ANY, registry=ANY)
+            mock_delete_row.assert_any_call(tid, ANY, registry=ANY, end_reason="session_teardown")
 
 
 def test_list_sessions_reports_the_creator_as_owner(real_session_db, monkeypatch):

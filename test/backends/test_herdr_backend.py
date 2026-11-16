@@ -86,6 +86,12 @@ class TestHerdrBackendCommands:
     """Verify correct herdr CLI command construction for each method."""
 
     @patch("subprocess.run")
+    def test_restore_session_env_runs_no_herdr_command(self, mock_run, backend):
+        """``--env`` is pane-scoped on herdr (#1074): there is no workspace env to edit."""
+        backend.restore_session_env("cao-test", "KIRO_HOME", "/h")
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
     def test_session_exists_true(self, mock_run, backend):
         """session_exists returns True when workspace label matches."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
@@ -555,6 +561,28 @@ class TestHerdrBackendCommands:
         assert cmd[cmd.index("--format") + 1] == "text"
 
     @patch("subprocess.run")
+    def test_get_history_accepts_join_wrapped_and_reads_the_same_way(self, mock_run, backend):
+        """Contract parity: herdr has no rejoin flag, so join_wrapped changes
+        nothing here rather than raising (a TypeError inside the codex startup
+        check would be swallowed and silently disable the diagnostic)."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="pane output here"),  # pane read
+        ]
+
+        result = backend.get_history("cao-test", "window-0", join_wrapped=True)
+
+        assert result == "pane output here"
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert cmd[-5:] == ["read", "w1-1", "--source", "recent", "--lines", "500"][-5:]
+
+    @patch("subprocess.run")
     def test_get_history_default_omits_format(self, mock_run, backend):
         """strip_escapes=False leaves format unset (herdr default preserved)."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
@@ -572,6 +600,45 @@ class TestHerdrBackendCommands:
 
         cmd = mock_run.call_args_list[-1][0][0]
         assert "--format" not in cmd
+
+    @patch("subprocess.run")
+    def test_get_history_full_history_requests_exactly_what_herdr_can_return(
+        self, mock_run, backend
+    ):
+        """full_history must ask for herdr's read ceiling, no more, no less (#728).
+
+        A flagless ``pane read`` returns a screenful (herdr defaults ``--lines``
+        to 80), which is why the deepest rung of get_output's ladder read LESS
+        than the 5000-line rung before it. But herdr also clamps every read to
+        1000 lines (v0.9.5 ``src/app/api_helpers.rs:117``), so asking for more
+        than that is a lie in the argv: the request looks deep and the reply
+        is still 1000 lines. Ask for the ceiling itself.
+        """
+        from cli_agent_orchestrator.constants import HERDR_PANE_READ_MAX_LINES
+
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="deep scrollback"),  # pane read
+        ]
+
+        backend.get_history("cao-test", "window-0", full_history=True)
+
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert "--lines" in cmd, "the deepest rung must name a line count"
+        requested = int(cmd[cmd.index("--lines") + 1])
+        assert requested == HERDR_PANE_READ_MAX_LINES == backend.max_history_lines
+
+    def test_max_history_lines_is_herdrs_documented_read_clamp(self, backend):
+        """The cap get_output clips its ladder to must be the number herdr
+        enforces, not CAO's tmux floor: ``lines.min(1000)`` in herdr v0.9.5
+        ``src/app/api_helpers.rs:117`` (default 80 at ``:118``)."""
+        assert backend.max_history_lines == 1000
 
     @patch("subprocess.run")
     def test_get_pane_working_directory(self, mock_run, backend):
@@ -1512,6 +1579,86 @@ class TestBuildEnvArgs:
             assert emitted[key] == value
         assert not any(v in pairs for v in (f"{k}={spoof[k]}" for k in spoof))
 
+    def test_build_env_args_sets_histfile_to_dev_null_over_extra_env(self):
+        """The pane shell must not write agent launch commands to the user's history."""
+        from cli_agent_orchestrator.backends.herdr_backend import (
+            HerdrBackend,
+            _sanitize_herdr_args,
+        )
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid",
+            session_name="s",
+            extra_env={"HISTFILE": "/tmp/operator_hist"},
+        )
+        values = [pairs[i + 1] for i in range(0, len(pairs), 2)]
+        assert "HISTFILE=/dev/null" in values
+        assert "HISTFILE=/tmp/operator_hist" not in values
+        # The herdr arg sanitizer must accept the pair, or terminal creation fails.
+        args = ["tab", "create", "--workspace", "w1", "--env", "HISTFILE=/dev/null"]
+        assert _sanitize_herdr_args(args) == args
+
+    def test_build_env_args_forwards_this_cao_address_and_home(self, monkeypatch):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        monkeypatch.setenv("CAO_API_PORT", "9899")
+        monkeypatch.setenv("CAO_HOME_DIR", "/srv/cao-b")
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="tid", session_name="s", extra_env={"CAO_HOME_DIR": "/srv/override"}
+        )
+        values = [pairs[i + 1] for i in range(0, len(pairs), 2)]
+        # A pane must reach the CAO that created it, whoever started the herdr server.
+        assert "CAO_API_PORT=9899" in values
+        assert not any(v.startswith("CAO_API_HOST=") for v in values)
+        # An operator-forwarded value still overrides, and the CAO-owned vars still come last.
+        assert "CAO_HOME_DIR=/srv/override" in values and "CAO_HOME_DIR=/srv/cao-b" not in values
+        assert values[-3:] == ["CAO_TERMINAL_ID=tid", "CAO_SESSION_NAME=s", "HISTFILE=/dev/null"]
+
+    def test_build_env_args_drops_a_server_env_value_the_sanitizer_would_reject(
+        self, monkeypatch, caplog
+    ):
+        """P3-1: before this PR, an unresolvable CAO_HOME_DIR made the server
+        fall back to defaults -- wrong, but the pane still launched. Baking
+        cao_server_env() values into ``--env`` must not turn that into a hard
+        failure for every pane on this CAO: an unsafe value is dropped (with a
+        warning), not forwarded raw into the sanitizer's ValueError."""
+        from pathlib import Path
+
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        monkeypatch.setenv("CAO_HOME_DIR", "irrelevant-now-only-presence-matters")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.mcp_resolution.CAO_HOME_DIR",
+            Path("/Users/me/R&D/cao-b"),
+        )
+        monkeypatch.delenv("CAO_API_HOST", raising=False)
+        monkeypatch.delenv("CAO_API_PORT", raising=False)
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(terminal_id="tid", session_name="s")
+        values = [pairs[i + 1] for i in range(0, len(pairs), 2)]
+        assert not any(v.startswith("CAO_HOME_DIR=") for v in values)
+        assert "CAO_TERMINAL_ID=tid" in values
+        assert "dropping" in caplog.text.lower() and "CAO_HOME_DIR" in caplog.text
+
+    def test_build_env_args_adds_nothing_for_a_default_cao(self, monkeypatch):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        for key in ("CAO_API_HOST", "CAO_API_PORT", "CAO_HOME_DIR"):
+            monkeypatch.delenv(key, raising=False)
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(terminal_id="tid", session_name="s")
+        assert pairs == [
+            "--env",
+            "CAO_TERMINAL_ID=tid",
+            "--env",
+            "CAO_SESSION_NAME=s",
+            "--env",
+            "HISTFILE=/dev/null",
+        ]
+
 
 class TestEnvValueRedaction:
     """P1: operator-forwarded --env values are secrets; they must never appear
@@ -1610,3 +1757,22 @@ class TestSanitizeEnvPairs:
 
         with pytest.raises(ValueError, match="unsafe characters"):
             _sanitize_herdr_args(["tab", "create", "--label", "a$b"])
+
+
+@patch("subprocess.run")
+def test_failed_command_keeps_stderr_out_of_the_exception(mock_run, backend, caplog):
+    """The exception text reaches HTTP 500 bodies; stderr stays in the server log."""
+    import logging
+
+    mock_run.return_value = _completed(returncode=2)
+    mock_run.return_value.stderr = "error: cannot connect to /Users/op/.herdr/sock --token=abc"
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(TerminalBackendError) as excinfo:
+            backend._run_herdr(["workspace", "list"])
+    message = str(excinfo.value)
+    assert "herdr command failed" in message
+    assert "exit 2" in message
+    assert "/Users/op/.herdr/sock" not in message
+    assert "--token=abc" not in message
+    assert "/Users/op/.herdr/sock" in caplog.text

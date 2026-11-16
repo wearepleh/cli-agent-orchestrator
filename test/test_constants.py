@@ -590,11 +590,26 @@ class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 
     def test_cao_home_dir_is_under_aws_cli_agent_orchestrator(self):
-        """Test that CAO_HOME_DIR is under ~/.aws/cli-agent-orchestrator."""
-        from cli_agent_orchestrator.constants import CAO_HOME_DIR
+        """With CAO_HOME_DIR unset, CAO_HOME_DIR is ~/.aws/cli-agent-orchestrator.
 
-        expected = Path.home() / ".aws" / "cli-agent-orchestrator"
-        assert CAO_HOME_DIR == expected
+        The constant is read at import, so a CAO_HOME_DIR in the runner's
+        environment (``CAO_HOME_DIR=$(mktemp -d) pytest ...``) replaces the
+        default. Reload with it unset to check the default, then reload under
+        the original environment so later tests see the session's value.
+        """
+        import importlib
+        import os
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        env = {k: v for k, v in os.environ.items() if k != "CAO_HOME_DIR"}
+        try:
+            with patch.dict("os.environ", env, clear=True):
+                importlib.reload(constants_module)
+                expected = Path.home() / ".aws" / "cli-agent-orchestrator"
+                assert constants_module.CAO_HOME_DIR == expected
+        finally:
+            importlib.reload(constants_module)
 
     def test_cao_home_dir_is_pathlib_path(self):
         """Test that CAO_HOME_DIR is a Path object."""
@@ -791,6 +806,45 @@ class TestEventBusConstants:
         mod = self._reload_constants({"CAO_EVENT_BUS_MAX_QUEUE_SIZE": "not-a-number"})
 
         assert mod.EVENT_BUS_MAX_QUEUE_SIZE == 16384
+
+
+class TestTmuxHistoryLimitConstant:
+    """``TMUX_HISTORY_LIMIT`` is the scrollback floor CAO raises a shared tmux
+    server to (#728). An operator on a memory-constrained box needs a way to
+    lower or disable it, so it reads ``CAO_TMUX_HISTORY_LIMIT``."""
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_TMUX_HISTORY_LIMIT", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_default_matches_the_recommended_tmux_conf(self):
+        mod = self._reload_constants({})
+
+        assert mod.TMUX_HISTORY_LIMIT == 50000
+
+    def test_env_override_is_honoured(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "8000"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 8000
+
+    def test_zero_is_a_valid_value_meaning_never_raise(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "0"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 0
+
+    def test_non_numeric_falls_back_to_the_default(self):
+        mod = self._reload_constants({"CAO_TMUX_HISTORY_LIMIT": "lots"})
+
+        assert mod.TMUX_HISTORY_LIMIT == 50000
 
 
 class TestOpenCodeConstants:

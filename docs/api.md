@@ -20,26 +20,59 @@ HTTP errors use standard status codes and generally return a JSON `detail`
 field. Authentication and network behavior depend on server configuration;
 see [Configuration](configuration.md) and [Security](../SECURITY.md).
 
+Handled responses carry an `X-Server-Time` header: the server's wall clock as
+an offset-aware ISO-8601 timestamp (an unhandled-exception 500 raised past the
+middleware stack does not). A browser client that renders relative
+times from server timestamps can measure its clock skew against it once and
+correct for it (WSL2 hosts have been observed hours adrift from the Windows
+browser next to them). The header is listed in `Access-Control-Expose-Headers`,
+so a page on another allowed origin (the Vite dev server, a configured
+`CAO_CORS_ORIGINS` deployment) can read it; without that a browser hides
+non-safelisted headers from `fetch`. It is informational; clients that ignore it are
+unaffected.
+
 ## HTTP route families
 
 ### Health and auth discovery
 
-- `GET /health` reports service health.
+- `GET /health` reports service health. Its `features` list names capabilities a
+  peer node can rely on; `delegation_ceiling` means this node bounds created
+  terminals by the caller's delegation ceiling and honours `caller_ceiling` (see
+  [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance)).
 - `GET /.well-known/oauth-protected-resource` publishes OAuth protected
   resource metadata when applicable.
 
 ### Events and AG-UI
 
 - `/events` and `/events/history` expose server events.
-- `/agui/v1/stream` and `/agui/v1/emit_ui` provide the AG-UI stream and
-  generative UI input.
+- `GET`/`POST /agui/v1/stream` serve the sessions and terminals this server can
+  see as an AG-UI 1.0 run, and `/agui/v1/emit_ui` takes generative UI input. `POST /agui/v1/run` is the run
+  plane for approval interrupts, and `GET /agui/v1/capabilities` returns its
+  AG-UI 1.0 `AgentCapabilities`.
 
 See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
 ### Profiles, providers, and settings
 
+- `POST /ephemeral-agents` creates and stores an opt-in, [ephemeral agent](ephemeral-agents.md).
+- `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` claims it under a lease,
+  rechecks policy and finalizes the profile. Its body accepts optional `idempotency_key`,
+  `claim_id` and `model`; per-call models refuse. It returns the claim, provider and stored tools,
+  and `provider_auto` (whether the spec declared `provider: "auto"`), or a matching launched
+  terminal with `replayed: true`.
+- `POST /sessions/{session}/terminals` launches it with `agent_profile`, `caller_id`, `provider`
+  and optional `claim_id` query parameters. Claims are 32 lowercase hexadecimal characters.
+  `POST /sessions` has no caller or claim parameter and refuses a created, pending ephemeral
+  name with `not_owner`. Collected names get `ephemeral_expired` (409); never-created names get
+  `unknown_ephemeral` (404), including on `POST /sessions`.
+- `POST /terminals/run-step` accepts `claim_id` for a newly created terminal; combining it with
+  `reuse_terminal_id` gives 422. Policy refusals use `{kind: "ephemeral_policy", rule, message}`.
+  `assign` and `handoff` launch creator-owned ephemeral names from the creator terminal.
 - `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
-  installed profiles.
+  installed profiles. A profile's `params` declarations appear in the detail
+  body: each one always carries `type` and `required`, and carries `default`,
+  `description` and `enum` only when set, in declaration order. See
+  [Workflow step params](agent-profile.md#workflow-step-params).
 - `GET /agents/profiles/search` ranks installed, loadable profiles by capability
   using the same service as `cao profile find`.
 - `GET /agents/profiles/templates` lists public template metadata (`name` and
@@ -56,6 +89,17 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   distinct from `templates/validate`, which checks a template *config* against
   that template's own schema. Findings are severity-tagged (`error` or
   `warning`); only errors clear the `valid` flag, so warnings are advisory.
+  The response also carries `params`, the profile's `params` block as the
+  model reads it, so an editor can show the declarations without parsing
+  YAML. Each declaration has the shape `GET /agents/profiles/{name}` returns,
+  in declaration order. The text is read as written, so a `${VAR}`
+  placeholder comes back as `${VAR}`. An empty block is `{}`. `params` is
+  `null` when the frontmatter has no `params` key, when a finding is an error
+  at `params` or below it, when an error stopped the checks before they
+  finished the block, such as a document past the ceilings below, or when the
+  block takes more than 64 KB as JSON. That limit stops YAML aliases from
+  making the response much larger than the request. The block is built from
+  the validated declarations, never from the parsed YAML.
 - `GET /agents/profiles/schema` returns the agent profile JSON-Schema, so a
   client can render create and edit forms from the server's definition instead
   of duplicating the field list.
@@ -133,11 +177,32 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 - Template validation and preview require the selected template to include a
   `schema.json` file.
 - `/agents/providers` reports provider availability.
+- Every write to `settings.json` (`POST /settings/*`, the session label
+  endpoint) is a locked read-modify-write published atomically, and it refuses
+  to run over a `settings.json` that exists but cannot be read or parsed: the
+  response is a `500` whose `detail` names the problem (never the server
+  path), and the file is left untouched rather than replaced by the one
+  section being written.
 - `/settings/*` exposes supported agent-directory, skill-directory, and memory
   settings.
 
 See [Agent Profiles](agent-profile.md) and
 [Configuration](configuration.md).
+
+- `GET /fs/dirs?path=` lists the subdirectories of one server-side folder
+  (directory names only, never files or contents; hidden folders after the
+  visible ones) for a folder picker, defaulting to the server user's home.
+  It accepts the same operator-typed spellings `working_directory` accepts
+  (see Sessions and terminals) but never creates anything, and it is
+  read-scope gated like `GET /settings/agent-dirs`. Note what it discloses:
+  child directory names for any path the server user can read, confined
+  only by the path policy's blocked subtrees (`/etc`, `/proc`, `/sys`,
+  `/dev`, `/root`, the system binary and library trees are refused at any
+  depth, bar `/dev/shm`; `/` and `/tmp` themselves stay listable so a picker
+  can descend through them). That is still stronger than the existence check
+  `working_directory` already gives a caller, so under an auth-enabled
+  deployment a read-scope token can enumerate the allowed tree; confine it
+  to a root if that is your deployment shape.
 
 ### Skills
 
@@ -148,12 +213,56 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 ### Sessions and terminals
 
 - `/sessions*` creates, lists, inspects, and deletes sessions.
-- `/sessions/{session_name}/terminals*` creates and lists session terminals.
+- `/sessions/{session_name}/terminals*` creates and lists session terminals. Each listed row also carries `status`, the last status the monitor applied (`null` when none has been observed). Unlike `GET /terminals/{id}` it does not re-detect, so a terminal that nothing polls can show `processing` after it went idle, until its status is next polled.
   The list is ordered oldest-first, and index 0 is the session's conductor —
   `cao session status`/`list` rely on that. Sort client-side on `last_active`
   if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- Terminal responses carry `identity_verified`, whether a `kiro_cli` terminal's
+  identity check has passed: `false` until it has (CAO refuses input to it
+  meanwhile, whatever `status` says), `true` after, `null` for other providers
+  and for Kiro terminals older than the record. See
+  [Kiro CLI](kiro-cli.md).
+- Terminal responses carry `delegate_tools`, the terminal's recorded delegation
+  ceiling. `POST /sessions/{session_name}/terminals` requires `caller_id` (403
+  without it) and checks the requested `allowed_tools` (client string or profile
+  resolution) against that caller's recorded ceiling, answering `403` when they
+  exceed it; the message names the parent, the child, the exceeding tools and
+  the remedy. An **operator** adding a terminal to an existing session (the Web
+  UI's Add Agent button) uses `POST /sessions/{session_name}/terminals:operator`
+  instead: same query parameters minus `caller_id`/`defer_init`, an optional
+  `{"description": ...}` body, and the new terminal records the profile's
+  declared ceiling exactly as `POST /sessions` does. It is a distinct sub-path
+  so no existing request can land on it by accident, and it answers `400` when
+  the request also names a caller (`caller_id`, `caller_ceiling`,
+  `delegating_terminal_id`, or a body `env_vars` carrying
+  `CAO_CALLBACK_TERMINAL_ID`). `POST /sessions?memory_manager=true` reports the
+  sidecar's outcome on the response as `memory_manager`
+  (`{"state": "scheduled" | "refused", "detail"}`); a primary whose ceiling does
+  not cover the sidecar's `@cao-mcp-server, fs_read, fs_list` gets `refused` and
+  no sidecar. A create's response may carry `launch_notes`, a list of strings for
+  the operator; today only a Kiro v3 launch that the operator's
+  `kiro.v3_allow_unverified_versions` opt-in admitted on a kiro-cli version still
+  pending verification (provisional, #1167). It is never persisted and is `null`
+  otherwise. `POST /sessions` and `POST /terminals/run-step` accept
+  `caller_ceiling` in the JSON body for a caller on another node (remote
+  `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
+  required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the
+  remote-assign shape), and when that callback terminal has a local row the
+  asserted ceiling must fit inside the row's. `caller_id` and `caller_ceiling`
+  remain client assertions under the shared bearer (per-terminal credentials are
+  tracked in [#965](https://github.com/awslabs/cli-agent-orchestrator/issues/965)); see
+  [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance) for what
+  that does and does not guarantee.
+- `POST /sessions`, `POST /sessions/{session_name}/terminals` and
+  `POST /sessions/{session_name}/terminals:operator` accept an optional `engine` query
+  parameter, and `POST /terminals/run-step` an optional `engine` body field: the Kiro
+  engine, `v2` or `v3` (`kas` is accepted as an alias of `v3`). It is valid only with
+  the `kiro_cli` provider, and must agree with the profile's `engine`, if the profile
+  sets one. Omitted, the profile's engine applies, else `v2`. An ephemeral Kiro helper
+  runs on v3 only: an explicit `v2` is refused with `kiro_ephemeral_engine:v2`; omit
+  the engine, or use `v3` (`kas`). See [Kiro v3 (preview)](kiro-cli.md#kiro-v3-preview).
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
@@ -167,6 +276,45 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   commits — commit and merge/push results before the terminal is deleted if
   they need to be kept. See the MCP `handoff`/`assign` tool descriptions for
   the full behavior.
+- `working_directory` on `POST /sessions`,
+  `POST /sessions/{session_name}/terminals` and
+  `POST /sessions/{session_name}/terminals:operator` is normalized at the
+  boundary the way an operator types it into a browser field: surrounding
+  quotes (Explorer's "Copy as path") are stripped, `~` is expanded, and on WSL
+  a Windows drive path (`C:\x\y` or `C:/x/y`) is translated to the interop
+  mount (`/mnt/c/x/y`) when that drive is mounted. The normalization itself
+  touches nothing on disk. The result is checked against the same path policy
+  as the MCP tools (a missing target is judged by its nearest existing
+  ancestor, so `/tmp/new` and `/etc/new` are refused). A relative
+  path, an existing non-directory, an unmounted drive, a Windows path that
+  walks out of its drive, a folder name over the 255-byte limit, or a
+  directory the OS refuses to create is a `400` with a plain-language
+  `detail` instead of a `500` from tmux. See
+  [Working directory](working-directory.md).
+- `create_working_directory` (default `false`) on those same three routes opts
+  the request in to CREATING a missing `working_directory`. Default off, so the
+  directory must exist -- which is the contract the MCP `handoff`/`assign` tool
+  descriptions state, and they send nothing. The dashboard sends `true`
+  whenever the operator typed a path. When a request does opt in, the directory
+  is created only once the session or terminal is actually being created, after
+  the duplicate-session, session-not-found, terminal-cap and delegation-ceiling
+  checks, so a request rejected at any point leaves nothing behind.
+- `GET /sessions/{session_name}`, `DELETE /sessions/{session_name}` and
+  `POST /sessions/{session_name}/label` prefix-normalize their name the same
+  way `POST /sessions` does, so `demo` and `cao-demo` address one session on
+  every route.
+- `POST /sessions/{session_name}/label` with `{"label": "..."}` sets a
+  friendly display name for a session (trimmed; longer than 60 characters is
+  a `422`, a control character or line break is a `400`; an empty string
+  clears it). It is a pure display alias stored in
+  `settings.json`, surfaced as `label` (or `null`) on `GET /sessions` and
+  `GET /sessions/{session_name}`, and cleared when the session is deleted;
+  nothing that references the real tmux session name is affected. Setting a
+  label for a session that does not exist is a `404`; clearing is accepted
+  regardless, since a session killed outside CAO leaves its label behind and
+  this is the only way to remove it. Setting or clearing over a
+  `settings.json` that exists but cannot be read is a `500` with nothing
+  changed on disk; session deletion logs that same condition and completes.
 - `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
   session's initial terminal into peer discovery (a mid-session worker uses
   `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).
@@ -198,12 +346,82 @@ security boundary on top of them.
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
 
+#### Terminal descriptions
+
+Terminal responses include a persistent `description: string | null`, independent
+of `metadata` and `group`. The optional JSON `description` field is accepted by
+`POST /sessions`, `POST /sessions/{session_name}/terminals`, and
+`POST /terminals/run-step`. Creation replaces line separators (including CRLF,
+NEL, and Unicode line/paragraph separators) with spaces, removes remaining C0/C1
+controls (`U+0000–001F`, `U+007F–009F`, including interior tabs), trims outer
+whitespace, and truncates to 64 Unicode code points. This counts neither bytes
+nor visible grapheme clusters. An empty normalized value is stored as `null`.
+
+For the first terminal of `POST /sessions`, omitting `description` uses the
+supplied session name as its default description. Explicit `{"description": null}`
+suppresses that default. Clients generating random session names should send
+`null`; other creation routes have no session-name default.
+
+`PATCH /terminals/{terminal_id}/description` replaces the value and returns the
+updated terminal. With authentication enabled it requires `cao:write` or
+`cao:admin`. Its JSON body must include `description`: an omitted key returns
+`422`, while `null`, an empty string, or whitespace alone clears the value.
+Editing applies the same normalization, but **rejects** a normalized value over
+64 code points with `422` instead of truncating it. A valid body for a missing
+terminal returns `404`; invalid bodies may return `422` before existence is
+checked.
+
+Reusing a terminal does not update its description. Idempotent creation retries
+also preserve an operator's subsequent edit. A non-null normalized creation
+description participates in the request fingerprint: omitting it is not
+equivalent to supplying a nonempty description on a retry. Normalization applies
+to new inputs and edits; existing rows and stored fingerprints are not migrated.
+
+#### Delegation body fields
+
+Three JSON bodies carry delegation-decision fields for the decision points
+(see [Launch decisions](decisions.md#points-and-states)): `CreateTerminalBody`
+(`POST /sessions/{session_name}/terminals`), `CreateSessionBody` (`POST /sessions`),
+and `RunStepRequest` (`POST /terminals/run-step`).
+
+- `delegation_message: string | null` (default `null`) is accepted by all three
+  bodies. If supplied, an empty string returns `422`; otherwise it must be a
+  nonempty string or omitted entirely. On `CreateTerminalBody`/`CreateSessionBody`
+  it is the only source the delegation decision reads — the decision runs only
+  when it is present. On `RunStepRequest` it substitutes for `prompt` as the
+  decision's input when supplied, and falls back to `prompt` when it is not.
+- `delegation_kind: "handoff" | null` (default `null`) is accepted by
+  `CreateTerminalBody` and `CreateSessionBody` only. Only the literal `"handoff"`
+  is accepted; any other value returns `422`. Setting it requires
+  `delegation_message` to also be set and `initial_message` to be absent, or the
+  request returns `422` ("delegation_kind requires delegation_message and no
+  initial_message"). Setting `delegation_message` without `delegation_kind`
+  instead requires `initial_message` to be set with
+  `initial_message_orchestration_type` equal to `"assign"`, or the request
+  returns `422` ("delegation_message requires delegation_kind or an ASSIGN
+  initial_message").
+- `orchestration_type: "handoff" | null` (default `null`) is `RunStepRequest`'s
+  equivalent of `delegation_kind` — this body has no `delegation_kind` field.
+  `orchestration_type` and `delegation_message` must be supplied together or
+  both omitted, or the request returns `422` ("orchestration_type and
+  delegation_message must travel together"). That check runs first, so
+  supplying only one of the two fields alongside `reuse_terminal_id` returns
+  the "must travel together" `422`, not the one below. Both fields combined
+  with `reuse_terminal_id` return `422` ("delegation fields cannot be combined
+  with reuse_terminal_id").
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
   `job_id` (32-character lowercase hex, e.g. `uuid4().hex`, generated by the
   caller). Supplying it opts the call into durable persistence; omitting it
   behaves exactly as before, with no persistence overhead.
+- A step-level `detail.kind` distinguishes worker failures (`error` -> 502),
+  in-band provider refusals (`provider_error` -> 502), and timeouts (`timeout` ->
+  504); callers branch on `kind`, not the numeric status alone. A reused Kiro
+  terminal (`reuse_terminal_id`) whose identity check is still running answers
+  `identity_pending` -> 409 with `retryable: true`: nothing was typed, so retry
+  the same call once it is ready.
 - `GET /handoff-results/{job_id}` retrieves the persisted record for that
   `job_id`. `state` is one of `running` (step still in progress), `completed`
   (result in `last_message`), or `error` (failure in `error_message`). `404`
@@ -230,13 +448,65 @@ than calling these routes directly.
 
 ### Workflows
 
-- `/workflows*` validates and inspects workflow specifications.
+- `/workflows*` creates, updates, deletes, validates and inspects workflow specifications.
+- `POST /workflows` creates a spec (`201`); requires `cao:write` or `cao:admin`. The body is
+  `{name, source, tier}`. `tier` is `"python"` (the default) or `"yaml"`, and the server picks
+  the file extension from it: `<name>.py` or `<name>.yaml`. The name must be bare, with no
+  path and no extension. Invalid specs or refused paths return `400`, existing names or tier
+  collisions `409`, and storage failures `500`.
+  - A YAML create validates the source with the YAML grammar check before writing. It returns
+    `{name, path, content_hash, findings, status, reserved_notes}`, where `findings` is empty,
+    `status` is `pass` or `pass_reserved`, and `content_hash` is the sha256 of the bytes written.
+  - A YAML create returns `400` when the YAML does not parse or fails the grammar check (the
+    detail lists every error), when the spec's `name:` differs from the route name, or when the
+    source is over 256 KiB. It returns `409` when a workflow with that name exists in either
+    tier, as `<name>.yaml`, `<name>.yml` or `<name>.py`.
+- `PUT /workflows/{name}` replaces a spec (`200`) using a required `expected_hash`;
+  requires `cao:write` or `cao:admin`. It takes the same optional `tier`, defaulting to
+  `"python"`. Unknown names return `404`, stale hashes or tier collisions `409`, invalid specs
+  or refused paths `400`, and storage failures `500`.
+  - A YAML update replaces the YAML file at its own path (`<name>.yaml` or `<name>.yml`) and
+    returns the same body as a YAML create. It also returns `409` when the workflow is a Python
+    workflow, and when both `<name>.yaml` and `<name>.yml` exist.
+- `GET /workflows/{name}` returns the parsed spec. For a YAML spec the body also carries `path`,
+  `source` (the file text) and `content_hash` (the sha256 of the file bytes). That hash is the
+  `expected_hash` a YAML `PUT` compares. Each YAML step carries `call` and `params`, which are
+  `null` when the file does not set them. A Python spec's body is unchanged.
+- `DELETE /workflows/{name}` deletes a spec and its index row (`200`); requires `cao:admin`.
+  An unknown or already-deleted name returns `404`; invalid paths return `400`.
+- `POST /workflows/validate` accepts exactly one of `path` or `source` (`200`);
+  requires `cao:read`, `cao:write` or `cao:admin`. The `source` form validates a draft
+  without writing a file. Its optional `tier` picks the check: `"python"` (the default) lints
+  the source as a script, and `"yaml"` returns the YAML result
+  `{status, reserved_notes, errors}`. Validation or size failures are reported in the `200`
+  result. Supplying both forms or neither, sending `tier` with `path`, or sending source that
+  cannot be encoded as UTF-8 returns `400`.
+  - For a YAML spec, in either form, once the grammar check passes, each step's params are
+    checked against the params its profile declares. Each error is added to `errors` and makes
+    `status` `fail`. A profile that is not installed or fails to load adds no error. See
+    [Params a profile declares](workflows.md#params-a-profile-declares).
+
+The spec-route scope checks apply when authentication is enabled.
+
 - `POST /workflows/runs` starts a run **inline** and holds the connection until it
-  finishes, returning the complete result.
+  finishes, returning the complete result. Its optional `working_directory` field selects
+  the script run's project root; it is ignored for YAML workflows. `caller_id` (also on
+  `:submit`, `resume` and step replay) names the terminal starting the run; every agent
+  step is then bounded by that terminal's recorded delegation ceiling. It is persisted on
+  the run's journal row, so a resume re-binds to the original caller. A script-tier
+  `POST /terminals/run-step` whose run has no live record (server restarted) is
+  refused with 403.
 - `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
   `events` appears only on a build that serves the events route, so treat it as optional.
+- Both run routes refuse a YAML workflow that uses a reserved mode, or a step whose `call` is
+  `assign` or `send_message`, with `501`. The refusal comes before the run is journaled, so
+  no run row exists for it.
+- Both run routes refuse a YAML workflow with `422` when a step's params do not fit the
+  params its profile declares. `detail` is a string holding every error, joined by `; `. The
+  refusal comes before the run is journaled. Resume and step replay use the journaled spec and
+  do not check again.
 - `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
 - `GET /workflows/runs/{run_id}` **inspects** a run: run metadata, current state, and
   each step's durable projection — including the step's full `output_json` and
@@ -245,10 +515,48 @@ than calling these routes directly.
   retention note in [Configuration](configuration.md#memory-memory). It is a
   superset of the older status-snapshot shape, so callers reading only
   `state`/`current_step_id`/`steps[].{id,state,attempts}` are unaffected.
+  - `steps[].terminal_id` is set as soon as the step's terminal exists, while the step
+    runs. Before the run view it was set only after the step ended, and never for YAML
+    runs.
+  - `steps[].result` is the step's final answer, or `null`:
+    `{"text": "...", "status": "completed", "truncated": false, "redacted": false}`.
+    It is parsed from the step's saved result envelope. `text` is the step's last terminal
+    message with secrets redacted (`redacted`) and capped at 32 KiB (`truncated`). A step
+    that failed or was cancelled has empty `text`, and its state as `status`. `result` is
+    `null` for a step that has not settled, for runs from before the run view, and for an
+    envelope that does not parse.
+- `GET /workflows/runs/{run_id}/steps/{step_id}/screen` returns a running step's screen:
+  `{terminal_id, text, truncated, redacted, captured_at}`. `text` is plain text with no
+  escape codes: the visible screen plus the scrollback above it, at most 200 lines and
+  64 KiB, with secrets redacted. Rows the terminal wrapped at its width are joined first,
+  so a secret that wraps is still redacted. herdr cannot join them, so on herdr a secret
+  split across lines is not redacted. `captured_at` is an ISO-8601 UTC time. The capture is
+  read-only: it attaches no client, sends no input and never resizes the agent's window.
+  Malformed `run_id` or `step_id` 400; unknown run or step, or a step with no terminal
+  recorded, 404; a terminal that has ended 410 (read the transcript instead).
+- `GET /workflows/runs/{run_id}/steps/{step_id}/transcript` returns a finished step's saved
+  transcript: `{terminal_id, text, truncated, redacted}`. `text` is the last 256 KiB of the
+  terminal's `<terminal_id>.scrollback` file, starting at a line, with secrets redacted.
+  CAO saves that file with wrapped rows joined, for the same reason as the screen.
+  Secrets are redacted before the text is cut, so a secret split at the cut is never
+  returned in part. `truncated` means the file holds more than `text`. Malformed `run_id`
+  or `step_id` 400; unknown run or step, no terminal recorded, or no transcript file yet
+  (the step is still running, the run predates the run view, or the file was deleted after
+  `RETENTION_DAYS`) 404.
+- Both step routes take the terminal id from the step's journal row, never from the
+  request.
 - `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
   is not journaled); per-step outputs are on `steps[].output`.
+- `GET /workflows/runs/{run_id}/artifacts` lists the run's string inputs that name a report
+  file the web UI can show: `{run_id, artifacts: [{input, path, available, size}]}`.
+  `GET /workflows/runs/{run_id}/artifacts/{input_name}` returns that file as
+  `{run_id, input, path, size, content}`. The caller names an **input**, never a path:
+  the recorded value must resolve (symlinks followed) to a regular `.md` file directly in
+  the system temp dir and be at most 256 KiB. Unknown run 404; undeclared or non-string
+  input 400; a path outside that directory or not `.md` 403; no such file 404; too large
+  413 (refused, never truncated).
 - `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
   `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
 - `POST /workflows/runs/{run_id}/steps/{step_id}:replay` re-executes **one** recorded step
@@ -264,13 +572,21 @@ than calling these routes directly.
   terminal-layer failures too, not only step timeouts: a provider that never initializes
   and a completed step whose output cannot be extracted are both reported as data, since
   neither says the request was bad. The 4xx/422 list is exactly the preflight checks —
-  every one of them is decided before the step runs.
+  every one of them is decided before the step runs. Approval-relevant profile or memory
+  drift returns `409` with `detail.kind: "plan_inputs_changed"` before the step launches.
 - `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
   any **declared** gaps. One content-negotiated path, two arms: send
   `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a
   JSON page. `?after_seq=` is the replay cursor and must be `>= 0`; on the SSE arm it
   takes precedence over `Last-Event-ID`. A gap is data the server declares when an
   append was lost — never inferred by the client from seq numbering.
+  - `terminal.created` is emitted as soon as a step's terminal exists, before the step
+    finishes. Each attempt that opens a terminal emits one, carrying `step_id`, `attempt`,
+    `terminal_id`, `provider` and `agent_profile`. Per attempt the order is
+    `step.attempt.started`, `terminal.created`, then the attempt's outcome
+    (`step.completed`, `step.attempt.failed`, `step.failed` or `step.skipped`). The
+    structured-output reprompt runs on a new terminal within the same attempt and emits
+    its own `terminal.created`, with the same `attempt`, after `step.reprompted`.
 - `GET /workflows/runs/{run_id}/compare?against={other_run_id}` reports per-step
   differences between two runs. Outputs are compared at the reference level, never by
   diffing payloads. An unknown id on **either** side is a 404, not a partial compare.
@@ -286,12 +602,30 @@ than calling these routes directly.
   terminal's append-only log, for correlating a step with the terminal output it
   produced. `length` is capped server-side.
 
-All five reads above (inspect, events, compare, diagnostics, and the run list)
-require a `cao:read`, `cao:write`, or `cao:admin` scope **when authentication is
-enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured — the default —
-that check is inert.
+All seven reads above (inspect, the step screen and transcript, events, compare,
+diagnostics, and the run list) require a `cao:read`, `cao:write`, or `cao:admin` scope
+**when authentication is enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured,
+which is the default, that check is inert.
 
 See [Workflows](workflows.md).
+
+### Fleet
+
+Read-only views of a CAO cluster's workers, reached through the fleet's worker broker
+(`CAO_ELASTIC_BROKER_URL` / `CAO_ELASTIC_BROKER_TOKEN` in cao-server's environment). No
+broker configured, unreachable, or erroring is a `503` carrying the broker's message.
+Releasing workers and shutting the fleet down stay CLI actions (`cao worker release`,
+`cao fleet shutdown`). This is the Kubernetes worker fleet behind `cao fleet`, not the
+sessions-and-terminals fleet in the AG-UI stream.
+
+- `GET /fleet/status` mirrors `cao fleet status`: `{broker, live, cleanup_pending, states}`.
+- `GET /fleet/workers` mirrors `cao worker list` (`?all=true` for `--all`):
+  `{broker, workers: [{worker_id, state, reason, agent_profile, provider, age_seconds,
+  workload_present, cleanup_pending, lease_tracked}]}`. Only those fields are returned.
+- `GET /fleet/workers/{worker_id}` mirrors `cao worker status`:
+  `{worker_id, lease, terminal, terminal_error, last_output}`. `terminal` carries
+  `{id, name, session_name, agent_profile, provider, status}`; `last_output` is capped at
+  4000 characters. A malformed id is `400`; no lease and no answering worker is `404`.
 
 ### Memory and graph
 
@@ -309,6 +643,18 @@ See [Workflows](workflows.md).
   "disabled" internally, and reporting that as 404 would tell the caller a
   configuration story about a filesystem fault. These are the routes the
   `report_outcome` / `list_outcomes` MCP tools call.
+  `POST /outcomes` also takes an optional `launch_terminal_id` (the MCP
+  tool's `terminal_id`), which links the outcome to that terminal's launch
+  record. The link is checked against the stored record before anything is
+  written: only a self-report (`source_terminal_id` equals
+  `launch_terminal_id`) or the launch's direct creator (the record's
+  `caller_id`) may link. The route answers **403** and writes nothing when
+  records exist for that id and none is bound to the reporter, or when
+  `launch_terminal_id` comes without a `source_terminal_id`. When
+  `launch_terminal_id` is sent, the response carries `launch_linked`: `true`
+  if the outcome was joined to a launch record, and `false` if it was written
+  without a link (no record for the id, a self-report on a launch that has
+  already ended, or a link that could not be read or written).
 - `/internal/memory/*` serves the memory tools on a node that does not own the
   database (`CAO_MEMORY_API_URL`). Its `key` is validated leniently and then
   normalised, matching what the tools have always done in-process — the strict

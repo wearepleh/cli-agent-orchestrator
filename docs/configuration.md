@@ -20,9 +20,9 @@ Set the `CAO_HOME_DIR` environment variable to relocate that entire tree:
 export CAO_HOME_DIR="$HOME/.cli-agent-orchestrator"
 ```
 
-Every derived path resolves from this value, so one override moves everything — with two exceptions noted below. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location. Empty or whitespace-only values are treated as unset, and tilde (`~`) is expanded.
+Every derived path resolves from this value, so one override moves everything — with two exceptions noted below. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location. Exactly one `cao-server` may run per `CAO_HOME_DIR`: the server holds an exclusive `flock` on `server.lock` inside it for its lifetime, and a second server started against the same directory, even on a different port, refuses to start and names the process that owns it (#406, #709); run a second server only with its own `CAO_HOME_DIR` and `--port`. Empty or whitespace-only values are treated as unset, and tilde (`~`) is expanded.
 
-**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place.
+**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place. When only the *client* side is locked down (an agent CLI that sandboxes its MCP servers, while `cao-server` runs normally), `assign` and `handoff` fetch the agent profiles they need from `cao-server` automatically, so no relocation is needed for that case.
 
 **Security note.** When relocating outside `~/.aws`, choose a dedicated directory that is not world-readable or shared with other users. CAO creates its base directory and log/FIFO subdirectories with owner-only permissions (mode `0700`), and applies a best-effort `chmod` to an existing base directory, but the chosen parent path should also be private since terminal logs can capture secrets and tokens.
 
@@ -60,11 +60,20 @@ Every derived path resolves from this value, so one override moves everything �
     "enabled": true,
     "compile_mode": "llm",
     "flush_threshold": 0.85,
+    "explain_enabled": true,
+    "non_accessing_inspection": false,
+    "lifecycle": {"enabled": false},
     "compile_timeout_s": 120.0
   },
   "terminal": {
     "backend": "tmux",
-    "herdr_session": "cao"
+    "herdr_session": "cao",
+    "keep_finished": {
+      "enabled": false,
+      "idle_window_minutes": 60,
+      "max_per_session": 5,
+      "on_cap": "teardown_oldest"
+    }
   },
   "apps": {
     "enabled": false,
@@ -82,11 +91,32 @@ Every derived path resolves from this value, so one override moves everything �
   },
   "logging": {
     "level": "INFO"
+  },
+  "ephemeral": {
+    "enabled": false,
+    "allowed_providers": ["claude_code"]
+  },
+  "decisions": {
+    "points": {
+      "model.route": {"state": "off", "decider": "fixed_table"},
+      "effort.route": {"state": "off", "decider": "fixed_table"}
+    },
+    "on_timeout_ms": 1000,
+    "confidence_threshold": 0.7,
+    "retention_days": 90
+  },
+  "model_tiers": {},
+  "kiro": {
+    "v3_allow_unverified_versions": false
   }
 }
 ```
 
 Every top-level key is optional — omit any section/key you don't want to override; `ConfigService` fills in built-in defaults.
+The `ephemeral`, `decisions`, `model_tiers` and `kiro` blocks are read outside `ConfigService`. See
+[Ephemeral agents (`ephemeral`)](#ephemeral-agents-ephemeral) below for every `ephemeral` key,
+[Launch decisions](decisions.md#settings) for `decisions` and `model_tiers`, and
+[Kiro v3 (`kiro`)](#kiro-v3-kiro) for `kiro`.
 
 ## `cao config` CLI
 
@@ -121,6 +151,50 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 `agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` / `workflow_scout` roles.
 
+### Ephemeral agents (`ephemeral`)
+
+Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
+creator-owned ephemeral names from the creator terminal.
+Only JSON `true` enables the tool. An agent sees it only once its CAO MCP connection
+restarts: reconnect it (in Claude Code, `/mcp`, then reconnect the CAO server) or restart the
+agent's terminal.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Enable ephemeral creation, claims and owner-only HTTP launch. |
+| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex and Kiro (`kiro_cli`) are operator opt-ins. |
+| `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
+| `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched or swept. |
+| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. With `model_tier`, `effort` or `provider` set to `"auto"` it must be at least `n * decisions.on_timeout_ms / 1000 + 30`, where `n` counts the fields set to `"auto"`, `provider` included. |
+| `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
+| `min_tier` | `null` | Optional minimum model tier; must not exceed `max_tier` and needs a `default_tier` at or above it. |
+| `max_tier` | `null` | Maximum model tier; a ceiling requires a default at or below it and mappings for every permitted tier, from the floor up, and allowed provider. |
+| `default_tier` | `null` | Model tier used when the spec omits `model_tier`, resolved once at creation and required to be mapped for every allowed provider. |
+| `min_effort` | `null` | Optional minimum reasoning effort; must not exceed `max_effort` and needs a `default_effort` at or above it. |
+| `max_effort` | `null` | Maximum reasoning effort; a ceiling requires a default at or below it. |
+| `default_effort` | `null` | Reasoning effort used when the spec omits `effort`, resolved once at creation. |
+| `provider_route` | `{"equivalent": []}` | Disjoint sets of providers a decider may choose between for a `provider: "auto"` spec. Each set names two or more supported providers that `provider.route` can route to (not `kiro_cli` yet) and must not mix an advisory provider with a hard or sandboxed one; anything else refuses every create and claim with `policy_config_error:provider_route`. With today's providers no set validates. Provisional (#1099). |
+| `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
+| `max_live_per_session` | `0` | Opt-in cap on the pending, claimed and launched names one session may hold. `0` means no cap; for example, `32` suits a fleet-style supervisor. Collected and expired pending names don't count. |
+| `launch_grace_seconds` | `600` | How long periodic sweeps wait after a bind before collecting a launched name with no terminal row. The startup sweep doesn't wait. Rowless live files must also be this old before any sweep deletes them. |
+| `sweep_interval_seconds` | `300` | Seconds between periodic sweeps, at most one day. |
+| `retention_days` | `14` | Days a collected name's archive and registry row are kept, counted only once its terminal and live files are gone. |
+
+See [Ephemeral agents](ephemeral-agents.md) for policy limits, model tier and effort policy,
+and lifecycle cleanup. Keep the feature disabled outside testing.
+
+### Kiro v3 (`kiro`)
+
+Operator-only, read straight from `settings.json` (no environment override). Provisional (#1167).
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `v3_allow_unverified_versions` | `false` | Only JSON `true` lets a Kiro v3 launch run on a kiro-cli version still *pending operator verification*, so an operator can run the live checklist on it. By itself it never admits an unlisted version, and every other v3 check still applies. Each admitted launch logs a warning and carries a `launch_notes` entry. Keep it off otherwise. |
+
+Only `kiro.v3_admission: "observed"` enables [observed admission](kiro-cli.md#observed-admission-operator-only) for eligible unlisted versions on the sealed-home helper path; installed-agent launches and every other setting value keep strict admission.
+
+See [Kiro v3 (preview)](kiro-cli.md#pending-versions-operator-only).
+
 ### Skills (`skills`)
 
 Skills (loaded on demand via the `load_skill` MCP tool) are discovered from, in order:
@@ -136,10 +210,10 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 
 | Setting | Default | Description |
 |---------|---------|--------------|
-| `mcp_request_timeout` | `30` | Seconds to wait for HTTP calls between the MCP server process and the CAO API. |
+| `mcp_request_timeout` | `30` | Seconds to wait for HTTP calls between the MCP server process and the CAO API. Does not apply to a create the server answers only after provider init (`cao launch` without `--headless`, `cao agent handoff`, the `launch_agent` app gesture, `cao-ops` `launch_session` without a message); those waits are sized from `provider_init_timeout` instead. |
 | `event_bus_max_queue_size` | `1024` | Max events buffered per subscriber queue in the internal event bus. |
-| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity) may run. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). |
-| `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
+| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. On Kiro v3 it also sizes the wait for MCP servers to finish loading before the first task — see [How long CAO waits for MCP servers](kiro-cli.md#how-long-cao-waits-for-mcp-servers). Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). Client processes also read this value to size how long they wait for a synchronous create, so set it where the client runs too (not only in `cao-server`'s environment) when the two differ, for example a client pointed at another host through `CAO_API_HOST`; `GET /health` reports the value the server is using. When a launch fails this way, CAO keeps any other agents already running in its session ([When a launch fails while it starts](terminal-lifecycle.md#when-a-launch-fails-while-it-starts)). |
+| `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs, Codex's trust and update dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
 | `state_buffer_max` | `32768` | Bytes of raw terminal output `StatusMonitor` keeps per terminal for raw-path status detection and `GET /terminals/{id}/output` (`mode=full`). Not unbounded scrollback — a long, chatty session is truncated to this trailing window; raise it if a still-pending prompt is getting evicted before it's read back. |
 
 ### Memory (`memory`)
@@ -148,6 +222,10 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 |---------|---------|--------------|
 | `enabled` | `true` | Master switch for the memory subsystem. |
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
+| `lifecycle.enabled` | `false` | Opt-in active supersedes exclusion for injection plus recall demotion/labels. Nested under `memory.lifecycle`; env override `CAO_MEMORY_LIFECYCLE_ENABLED`. Read/validation errors leave it off. |
+| `ranking.default_sort` | `"recency"` | Default query recall ranking: `recency` preserves hybrid recall, while `bm25` opts into BM25-first results. No-query listings remain recency ordered. Nested under `memory.ranking`. |
+| `non_accessing_inspection` | `false` | CLI list/show and HTTP GET memory views skip access counters when on. MCP/internal recall still counts. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave it off. |
+| `explain_enabled` | `true` | On-demand `cao memory list --query Q --explain` diagnostic. Env override: `CAO_MEMORY_EXPLAIN_ENABLED` (env > file > default). Does not alter recall defaults or gate `sort_by="relevance"`. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
 | `vault` | `{}` | Validated Obsidian vault source configuration. `CAO_MEMORY_VAULT_ENABLED=false` can disable it but cannot enable an absent or file-disabled configuration. |
@@ -164,8 +242,10 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 > `workflow_run_step` projection persists each step's full `output_json` and `error`
 > text on every state transition, unconditionally, because the resume path and
 > `{{steps.<id>.output.<field>}}` templating read them back — gating them would
-> break both. The flag governs only the event-log output digest and the diagnostics
-> bundle's excerpts.
+> break both. Each settled step also stores its final answer in `result_json`, for
+> both script and YAML steps, after secret redaction and capped at 32 KiB; the web
+> UI's Output tab reads it. The flag governs only the event-log output digest and the
+> diagnostics bundle's excerpts.
 >
 > That retained text is served, in full, by `GET /workflows/runs/{run_id}`. Its only
 > protection is a scope requirement (`cao:read`/`cao:write`/`cao:admin`), and that
@@ -220,6 +300,14 @@ CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an expe
 - `pane_layout`: how that window is re-arranged after each spawn — `"tiled"`
   (default), `"even-vertical"`, `"even-horizontal"`, or `"none"`. See
   [Choosing a layout](#choosing-a-layout).
+- `keep_finished`: keep finished child agents open so you can see what they did,
+  for workshops and debugging. Off by default; turn it on with
+  `cao config set terminal.keep_finished.enabled true`. Its four keys (`enabled`,
+  `idle_window_minutes`, `max_per_session`, `on_cap`), the reaper that cleans kept
+  agents up, and what stays unchanged are in
+  [Keep finished agents](terminal-lifecycle.md#keep-finished-agents-for-workshops-and-debugging).
+  A bad value is refused by `cao config set`, and logged and treated as off when it
+  is already in the file. It has no environment variable.
 
 Select a backend for a single run without touching `settings.json`:
 
@@ -298,6 +386,20 @@ every lookup resolves through it. Set that option only at pane scope — pane
 options inherit from window options, and a value set globally would make every
 pane answer to the same name.
 
+That name is also what the window shows. The first pane terminal turns on
+`pane-border-status` for `pane_window` and formats the border with the mark, so
+every pane is captioned with the terminal running in it. The caption reads the
+mark rather than the pane title because a program in the pane can set its own
+title: an agent whose TUI does that turns a title-based caption into whatever
+the agent wants, while the mark is out of its reach.
+
+Both options are set on `pane_window` alone, and only when that window carries
+no `pane-border-status` of its own -- so a window you arranged yourself keeps
+its borders, `pane-border-status off` stays off, and a window CAO opened before
+this existed is captioned on the next spawn into it rather than never. A pane
+you split by hand carries no mark and is captioned with its index. The captions
+cost one row per pane, which counts against the capacity above.
+
 `pane_window` does not have to exist: the first pane-mode terminal in a session
 creates it and takes its first pane, and the ones after it split that window.
 
@@ -309,6 +411,54 @@ working directory, are reported rather than worked around.
 The name is a label, not an authenticated identity: anything that can reach the
 tmux socket can set the same mark. Agents are not isolated from each other here,
 so this is in line with the rest of the backend rather than a new exposure.
+
+#### Browser terminals in pane mode
+
+A web terminal (the Workspace tab, or the Agents tab overlay) on a pane-mode
+agent shows the **whole** `pane_window`, every agent's pane tiled, with that
+agent's pane selected. Two web terminals on agents of the same window therefore
+show the same tiled window, not one agent each; window mode gives each terminal
+its own window.
+
+**Keys** reach only the agent the terminal belongs to. tmux keeps one active
+pane per window, not per client, so cao-server selects the terminal's pane
+before every input it forwards and holds that window until tmux has read the
+input, so a paste in one terminal and a key in another cannot interleave. Input
+that ends in Escape, Alt+[, Alt+] or Alt+Shift+P holds the window a little
+longer: tmux keeps these as a partial key until its `escape-time` runs out (10
+ms by default since tmux 3.5, 500 ms before), in case more of an escape sequence
+follows, and only then delivers them to the pane that is active. (Alt+Shift+P is
+a partial key only in the first seconds after a terminal attaches, while tmux
+waits for the answer to one of its own terminal queries; it holds the window
+every time, which costs only the short wait below.) So after such a key, other
+web terminals on the same window wait before their next key, and a terminal
+opened on that window in that time selects its pane only afterwards. The wait
+lasts until `escape-time` has run out after the sending terminal's last such
+key, counted as at least 500 ms. So with an `escape-time` of 500 ms or less
+(tmux's defaults) it is about half a second after a single such key; with a
+longer `escape-time` it is that long. It is also longer while that terminal
+keeps sending such keys (Escape held down, for example). The sender's next key
+does not end the wait early: cao-server cannot tell whether that key completes
+the escape sequence or extends it, and tmux's timer keeps running from the first
+byte. The terminal that sent the key does not wait. Input whose pane cannot be
+selected is dropped rather than sent to whichever pane is active, and a terminal
+whose pane cannot be found is not attached.
+
+**The mouse** works as it does in tmux: a click or the wheel acts on the pane
+under the pointer, even another agent's tile. A click makes that pane the
+active one; your next key goes to your own agent again. The wheel goes to the
+program in the pane under the pointer if that program uses the mouse or (since
+tmux 3.6) is in the alternate screen, as full-screen agent CLIs usually are.
+Otherwise it puts that pane into copy mode, where it reads keys as copy-mode
+commands, so an agent scrolled that way does not see what is typed to it until
+copy mode ends: press `q` in that agent's terminal (or scroll back to the
+bottom).
+
+One case is outside cao-server's reach: selecting another pane by hand, from a
+real terminal attached to the same window, in the instant between cao-server's
+selection and tmux reading the input. Work in a different window, or in window
+mode, if you drive pane-mode agents from a real terminal while typing to them
+from the browser.
 
 ### MCP Apps (`apps`)
 
@@ -357,7 +507,7 @@ Default-off auth core; see [security/auth.py](../src/cli_agent_orchestrator/secu
 
 > **Default posture.** With none of the three variables set, the API performs no authentication or authorization at all: every scope dependency returns the full scope set and never inspects the request. The server binds to loopback by default, so the trust boundary is *the host*, not *the user* — any other process or local account on the machine can reach every endpoint, including keystroke injection into agent terminals. That is intentional for a single-user workstation and it is why the local-token mode exists for anything else. A few routes stay open in every mode because they carry no session or terminal state: `/health`, the API documentation (`/docs`, `/redoc`, `/openapi.json`), the OAuth discovery document, the agent-profile schema and template metadata and their validate/preview endpoints, and the static topology-widget assets.
 >
-> Two clients do not yet present a bearer in **either** auth mode and therefore cannot be used against an auth-enabled server without further work: the bundled Web UI, and the `cao` CLI's own HTTP calls (`cao launch`, `cao session`, `cao terminal`, `cao workflow`, `cao info`, `cao shutdown`). The `cao agent` subcommands, the MCP servers and the workflow orchestration helpers do forward `CAO_AUTH_LOCAL_TOKEN`.
+> **Clients.** Every CAO client presents the bearer in either mode. The `cao agent` subcommands, the MCP servers and the workflow orchestration helpers forward `CAO_AUTH_LOCAL_TOKEN` on their internal calls; the `cao` CLI's own HTTP calls (`cao launch`, `cao session`, `cao terminal`, `cao workflow`, `cao info`, `cao shutdown` and the polling behind them) go through `utils/api_http.py`, which attaches `CAO_AUTH_LOCAL_TOKEN` from the CLI's environment to requests aimed at this node's `API_BASE_URL` and to nothing else, and turns a `401` with no token configured into an error that names the variable. Export the same `CAO_AUTH_LOCAL_TOKEN` the server was started with (local-token mode), or a machine token from the IdP with the scopes the command needs, in the shell that runs `cao`. The bundled Web UI takes its token from the URL fragment (`http://127.0.0.1:9889/#token=<token>`; the fragment is moved into `sessionStorage` and stripped from the address bar before anything renders, so it never reaches the server as part of a URL) or from the **Server Access Token** field on the Settings page; it is held for that browser tab only, sent as `Authorization: Bearer` on every request, as `?token=` on the terminal WebSocket handshake and as `?access_token=` on the workflow event stream (both query parameters are redacted from the access log). With no token set, every client sends exactly what it sent before.
 
 | Env var | Description |
 |---------|--------------|
@@ -389,6 +539,9 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str |
 | `CAO_LOG_LEVEL` | `logging.level` | str |
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |
+| `CAO_MEMORY_LIFECYCLE_ENABLED` | `memory.lifecycle.enabled` | bool |
+| `CAO_MEMORY_NON_ACCESSING_INSPECTION` | `memory.non_accessing_inspection` | bool |
+| `CAO_MEMORY_EXPLAIN_ENABLED` | `memory.explain_enabled` | bool |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str (`llm`/`append`) |
 | `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float |
 | `CAO_MEMORY_VAULT_ENABLED` | `memory.vault.enabled` | bool (disable-only) |
@@ -412,6 +565,19 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 | `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
 | `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
 | `CAO_WS_ALLOWED_ORIGINS` | `network.ws_allowed_origins` | comma-separated list |
+
+### Launch decisions
+
+`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE`,
+`CAO_DECISION_TASK_FEATURES`, `CAO_DECISION_ON_TIMEOUT_MS` and
+`CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
+`ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
+apply as written: `cao-server --decision <point>=<state>` sets the matching point-state variable
+(`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_PROVIDER_ROUTE` or
+`CAO_DECISION_TASK_FEATURES`), so the flag and that variable are one layer, and the server keeps
+the values it started with until it restarts. `decisions.match`, the local model catalog, has no
+environment override. See [Launch decisions](decisions.md#settings) and
+[Matching helpers to models](decisions.md#matching-helpers-to-models).
 
 ### Not yet routed through ConfigService
 

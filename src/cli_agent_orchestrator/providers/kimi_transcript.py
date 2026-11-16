@@ -228,14 +228,14 @@ WELCOME_BANNER_RE = re.compile(r"^\s*Welcome to Kimi Code(?: CLI)?!\s*$")
 # reaches IDLE.
 BOOT_MESSAGE_ROW_RE = re.compile(
     r"^\s*(?:[\u2800-\u28ff]\s*)?(?:"
-    r"Loading configuration|Loading agent|Resolving dependencies|Restoring conversation"
+    r"(?:Loading configuration|Loading agent|Resolving dependencies|Restoring conversation"
     r"|Send /help for help information"
-    r"|No session yet(?:\s*[—–-].*)?"
-    r"|Run /web to continue your session in the browser"
-    r"|✦\s*Try Kimi Code Web UI.*"
-    r"|MCP server \"[^\"]*\" connected(?:\s*·.*)?"
-    r"|tmux extended-keys is off.*"
-    r")\s*[.…\s]*$",
+    r"|Run /web to continue your session in the browser)[.…\s]*"
+    # A newline separates arbitrary detail text (.*) from any remaining suffix.
+    r"|No session yet(?:[.…\s]*|\s*[—–-].*(?:\n[.…\s]*)?)"
+    r"|MCP server \"[^\"]*\" connected(?:[.…\s]*|\s*·.*(?:\n[.…\s]*)?)"
+    r"|(?:✦\s*Try Kimi Code Web UI|tmux extended-keys is off).*(?:\n[.…\s]*)?"
+    r")$",
     re.IGNORECASE,
 )
 
@@ -251,10 +251,11 @@ BOOT_MESSAGE_ROW_RE = re.compile(
 # punctuation / counts — so "... is only a phrase" stays content.
 MCP_BOOT_ROW_RE = re.compile(
     r"^\s*(?:"
-    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d+.*"
+    # One digit establishes the second count; the suffix accepts any remaining digits.
+    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d.*(?:\n\s*)?"
     r"|[\u2800-\u28ff]\s*\S.*\(connecting\)\s*"
     r"|connecting to mcp servers[\s.…·()0-9/]*"
-    r")\s*$",
+    r")$",
     re.IGNORECASE,
 )
 
@@ -296,12 +297,6 @@ FOOTER_SEGMENT_RES: Tuple[re.Pattern, ...] = (
 FOOTER_TIP_RE = re.compile(
     r"ctrl-o to hide or reveal tool output|shift-tab to Plan mode|/goal for multi-step"
 )
-#: The same tips carrying the footer's own foreground colour.
-FOOTER_TIP_STYLE_RE = re.compile(
-    r"\x1b\[38;5;242m[^\x1b]*(?:ctrl-o to hide or reveal tool output"
-    r"|shift-tab to Plan mode|/goal for multi-step)"
-)
-
 # Segments that constitute a footer row on their own.
 LEGACY_STATUS_ROW_RE = re.compile(r"^\s*\d+:\d+\s.*(?:agent|shell)\s*\(")
 
@@ -342,6 +337,7 @@ _COMPOSER_FRAME_CHARS = "─╭╮╰╯│| \t"
 # User input echo. Kimi Code renders the submitted user message bold + colour
 # 222 with a leading sparkle; the legacy TUI uses the same sparkle inline.
 USER_INPUT_SPARKLE_RE = re.compile(r"[✨💫][^\S\n]+\S")
+USER_INPUT_CODE_PROMPT_RE = re.compile(r"^\s*❯[^\S\n]+\S")
 USER_INPUT_STYLE_RE = re.compile(r"\x1b\[1m\x1b\[38;5;222m|\x1b\[38;5;222m")
 
 #: The measured foreground index Kimi Code draws submitted user input in. A
@@ -368,7 +364,7 @@ LEGACY_IDLE_PROMPT_RE = re.compile(r"^\s*[✨💫]\s*$")
 # it — reproduced: `• The UI shows … (3 more lines, ctrl+o to expand) when output
 # is collapsed.` — was classified as execution plumbing and dropped from the
 # answer, even with a colour-253 answer bullet.
-COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"^\s*[•●]?\s*…\s*\(\d+ more lines")
+COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"^\s*(?:[•●]\s*)?…\s*\(\d+ more lines")
 
 # Kimi Code's inline key hints that sit under a running tool call. Matched as
 # the exact observed strings, not as a loose `^Press ` prefix: an assistant
@@ -476,6 +472,11 @@ TRUST_HINT_RE = re.compile(r"↑↓\s*navigate\s*·\s*Enter\s*select\s*·\s*Esc\
 TRUST_OPTION_TRUST = "Trust this folder"
 TRUST_OPTION_REJECT = "Don't trust"
 TRUST_OPTIONS: Tuple[str, ...] = (TRUST_OPTION_TRUST, TRUST_OPTION_REJECT)
+# Kimi Code 2.3 renamed the choices without changing the trust dialog.
+TRUST_OPTION_ALIASES = {
+    "Trust and continue": TRUST_OPTION_TRUST,
+    "Exit": TRUST_OPTION_REJECT,
+}
 # The trust dialog's selection marker is U+276F. Deliberately distinct from the
 # approval dialog's U+25B6 so one dialog's navigation can never be applied to
 # the other.
@@ -502,8 +503,8 @@ def _trust_option_body(stripped: str) -> str:
     """The option label on a row, with any selection marker removed."""
 
     if stripped.startswith(TRUST_SELECT_MARKER):
-        return stripped[len(TRUST_SELECT_MARKER) :].strip()
-    return stripped
+        stripped = stripped[len(TRUST_SELECT_MARKER) :].strip()
+    return TRUST_OPTION_ALIASES.get(stripped, stripped)
 
 
 def is_trust_option_row(clean_line: str) -> bool:
@@ -580,6 +581,8 @@ class KimiLineKind(enum.Enum):
     TOOL_CHROME = "tool_chrome"
     RULE = "rule"
     LIVE_SPINNER = "live_spinner"
+    LIVE_SWARM_PROGRESS = "live_swarm_progress"
+    SWARM_PROGRESS = "swarm_progress"
     IDLE_TIP = "idle_tip"
     READY_INPUT_FRAME = "ready_input_frame"
     STATUS_FOOTER = "status_footer"
@@ -632,6 +635,8 @@ CHROME_KINDS = frozenset(
         KimiLineKind.IDLE_TIP,
         KimiLineKind.TOOL_CALL,
         KimiLineKind.TOOL_CHROME,
+        KimiLineKind.LIVE_SWARM_PROGRESS,
+        KimiLineKind.SWARM_PROGRESS,
         KimiLineKind.RULE,
     }
 )
@@ -732,7 +737,7 @@ def _confirm_context_kinds(
     raw_lines: Sequence[str],
     clean_lines: Sequence[str],
     kinds: Sequence[KimiLineKind],
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    submission_starts: Sequence[bool],
 ) -> List[KimiLineKind]:
     """Promote only rows inside *their own* rendered UI region.
 
@@ -754,8 +759,8 @@ def _confirm_context_kinds(
     cleans = list(clean_lines)
     confirmed = list(kinds)
 
-    trust_rows = _confirmed_trust_dialog_rows(raws, cleans, semantics)
-    approval_rows = _confirmed_approval_dialog_rows(raws, cleans, semantics)
+    trust_rows = _confirmed_trust_dialog_rows(raws, cleans, submission_starts)
+    approval_rows = _confirmed_approval_dialog_rows(raws, cleans, submission_starts)
 
     for index, kind in enumerate(confirmed):
         if kind is KimiLineKind.TRUST_DIALOG and index not in trust_rows:
@@ -786,10 +791,8 @@ _DIALOG_REGION_MAX_LINES = 80
 
 
 def _dialog_scan_end(
-    raw_lines: Sequence[str],
-    clean_lines: Sequence[str],
+    submission_starts: Sequence[bool],
     start: int,
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
 ) -> int:
     """Bound one dialog search to its local turn/region.
 
@@ -797,16 +800,13 @@ def _dialog_scan_end(
     before it can own rows after it.  The hard line cap prevents a malformed
     capture from turning structural confirmation into an unbounded forward scan.
 
-    ``semantics`` is passed through to :func:`is_user_input_start` so the
-    boundary is identified with the same dialect-specific submission evidence the
-    main pass uses; a dimmed sparkle inside payload is not a submission.
+    Use the same submission candidates as the main pass, including its
+    capture-wide check for styling.
     """
 
-    end = min(len(clean_lines), start + _DIALOG_REGION_MAX_LINES)
+    end = min(len(submission_starts), start + _DIALOG_REGION_MAX_LINES)
     for index in range(start + 1, end):
-        raw = raw_lines[index] if index < len(raw_lines) else ""
-        clean = clean_lines[index]
-        if is_user_input_start(raw, clean, semantics):
+        if submission_starts[index]:
             return index
     return end
 
@@ -814,7 +814,7 @@ def _dialog_scan_end(
 def _confirmed_trust_dialog_rows(
     raw_lines: Sequence[str],
     clean_lines: Sequence[str],
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    submission_starts: Sequence[bool],
 ) -> Set[int]:
     """Rows belonging to positively rendered trust-dialog spans.
 
@@ -835,7 +835,7 @@ def _confirmed_trust_dialog_rows(
         if not TRUST_TITLE_RE.match(clean):
             continue
 
-        end = _dialog_scan_end(raw_lines, clean_lines, start, semantics)
+        end = _dialog_scan_end(submission_starts, start)
         hint_seen = False
         option_rows: List[int] = []
         selected_seen = False
@@ -871,7 +871,7 @@ def _confirmed_trust_dialog_rows(
 def _confirmed_approval_dialog_rows(
     raw_lines: Sequence[str],
     clean_lines: Sequence[str],
-    semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    submission_starts: Sequence[bool],
 ) -> Set[int]:
     """Rows belonging to positively rendered approval-dialog spans.
 
@@ -885,7 +885,7 @@ def _confirmed_approval_dialog_rows(
         if not APPROVAL_TITLE_RE.search(clean):
             continue
 
-        end = _dialog_scan_end(raw_lines, clean_lines, start, semantics)
+        end = _dialog_scan_end(submission_starts, start)
         hint_seen = False
         selected_rows: List[int] = []
         option_rows: List[int] = []
@@ -1097,7 +1097,11 @@ def is_status_footer_line(clean_line: str, raw_line: str = "") -> bool:
     if not FOOTER_TIP_RE.search(clean_line):
         return False
     if _SGR_RE.search(raw_line or ""):
-        return bool(FOOTER_TIP_STYLE_RE.search(raw_line))
+        # A tip must occur before the next escape, not under a later colour.
+        return any(
+            segment.startswith("[38;5;242m") and FOOTER_TIP_RE.search(segment)
+            for segment in raw_line.split("\x1b")[1:]
+        )
     return segments >= 1
 
 
@@ -1520,6 +1524,32 @@ def _confirm_ready_frames(
     ]
 
 
+def find_composer_prompt(rows: Sequence[Tuple[str, str, KimiLineKind]]) -> Optional[int]:
+    """Find the prompt in a confirmed composer, including multiline drafts.
+
+    The row classifier deliberately uses a small frame window to protect answer
+    tables. A draft can exceed that window, so follow the actual box borders
+    here without treating an unframed prompt-shaped table row as ready.
+    """
+    for bottom in range(len(rows) - 1, -1, -1):
+        if rows[bottom][2] is not KimiLineKind.READY_INPUT_FRAME or not _FRAME_EDGE_CLOSE_RE.match(
+            rows[bottom][1]
+        ):
+            continue
+        top = bottom - 1
+        while top >= 0 and _FRAME_BOX_ROW_RE.match(rows[top][1]):
+            top -= 1
+        if (
+            top >= 0
+            and top + 1 < bottom
+            and rows[top][2] is KimiLineKind.READY_INPUT_FRAME
+            and _FRAME_EDGE_OPEN_RE.match(rows[top][1])
+            and COMPOSER_PROMPT_RE.match(rows[top + 1][1])
+        ):
+            return top + 1
+    return None
+
+
 def is_response_marker_line(clean_line: str) -> bool:
     """True when ``clean_line`` starts a response/thinking bullet *with a payload*.
 
@@ -1587,6 +1617,8 @@ def is_user_input_start(
     raw_line: str,
     clean_line: Optional[str] = None,
     semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,
+    *,
+    capture_has_sgr: bool = False,
 ) -> bool:
     """True when the row is a positively identified *submitted* user message.
 
@@ -1617,6 +1649,14 @@ def is_user_input_start(
         and USER_INPUT_COLOR_INDEX not in foreground_color_indices(raw)
     ):
         return False
+
+    # Kimi Code 2.3 renders submitted messages with ❯ instead of a sparkle.
+    # A trust dialog uses the same glyph, so keep its option rows distinct and
+    # require the submission's foreground colour whenever SGR is available.
+    if semantics is SpinnerSemantics.CODE and USER_INPUT_CODE_PROMPT_RE.match(clean):
+        if capture_has_sgr or _SGR_RE.search(raw):
+            return is_drawn_in_foreground(raw, USER_INPUT_COLOR_INDEX)
+        return not is_trust_option_row(clean)
 
     return bool(
         USER_INPUT_SPARKLE_RE.search(clean)
@@ -1683,7 +1723,10 @@ def classify_line(
     # --- dialogs first: their rows would otherwise be read as content ---
     if TRUST_TITLE_RE.match(clean) or TRUST_HINT_RE.search(clean):
         return KimiLineKind.TRUST_DIALOG
-    if is_trust_option_row(clean):
+    # The 2.3 reject label is the ordinary word "Exit". A bare alias in an
+    # answer is content; the complete dialog is already identified by its
+    # title/hint, and detect_trust_dialog normalizes both option rows itself.
+    if is_trust_option_row(clean) and stripped not in TRUST_OPTION_ALIASES:
         return KimiLineKind.TRUST_DIALOG
     if stripped.startswith(TRUST_MCP_TARGETS_PREFIX):
         return KimiLineKind.TRUST_DIALOG
@@ -1736,6 +1779,276 @@ def classify_line(
         return KimiLineKind.USER_INPUT
 
     return KimiLineKind.CONTENT
+
+
+_SWARM_HEADER_RE = re.compile(r"^\s*─ Agent Swarm(?:\s+─|\s*$)")
+_SWARM_MEMBER_RE = re.compile(r"^\s*\d{3,}\s+\S")
+_SWARM_STATUS_PREFIX_RE = re.compile(
+    r"^\s*(?:[🌑🌒🌓🌔🌕🌖🌗🌘⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓✗⊘]\s+)?"
+    r"(?P<state>Working…|Orchestrating…|Prompting…|Rate limited…|Completed\.|Failed\.|Aborted\.)"
+    r"(?=\s|$)"
+)
+
+
+def _swarm_progress_rows(
+    raws: Sequence[str],
+    cleans: Sequence[str],
+    quoted: Set[int],
+) -> dict[int, KimiLineKind]:
+    """Confirm the native panel locally, rather than matching progress words.
+
+    Kimi can run AgentSwarm without its ordinary thinking spinner. Its panel
+    has an accent-coloured heading, numbered member rows and an aggregate
+    status. Only this contiguous region is chrome; quoted examples and tool
+    payload retain their existing ownership in ``classify_rows``.
+    """
+    result: dict[int, KimiLineKind] = {}
+    for start, clean in enumerate(cleans):
+        if start in quoted or not _SWARM_HEADER_RE.match(clean):
+            continue
+        if 111 not in foreground_color_indices(raws[start]):
+            continue
+        for end in range(start + 1, len(cleans)):
+            if end in quoted:
+                break
+            row = cleans[end]
+            if "\n" in row:
+                break
+            status = _SWARM_STATUS_PREFIX_RE.match(row)
+            if status:
+                state = status.group("state")
+                detail = row[status.end() :].strip()
+                if state not in {"Prompting…", "Orchestrating…"} and detail.strip("━"):
+                    break
+                if not _FOREGROUND_COLOR_RE.search(raws[end]):
+                    break
+                for index in range(start, end + 1):
+                    result[index] = (
+                        KimiLineKind.TOOL_CHROME if cleans[index].strip() else KimiLineKind.BLANK
+                    )
+                result[start] = KimiLineKind.TOOL_CALL
+                if state in {"Working…", "Orchestrating…", "Prompting…", "Rate limited…"}:
+                    result[end] = KimiLineKind.LIVE_SWARM_PROGRESS
+                else:
+                    result[end] = KimiLineKind.SWARM_PROGRESS
+                break
+            if row.strip() and not _SWARM_MEMBER_RE.match(row):
+                break
+    return result
+
+
+def has_live_swarm_progress(
+    output: str,
+    *,
+    require_submission: bool = False,
+) -> bool:
+    """Check the newest turn, excluding panels preceding its answer or echo."""
+    rows = classify_lines(
+        output,
+        SpinnerSemantics.CODE,
+        include_unclosed_fences=True,
+    )
+    last_submission = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    if require_submission and last_submission < 0:
+        return False
+    boundary = max(
+        (
+            i
+            for i, (_, _, kind) in enumerate(rows)
+            if kind in {KimiLineKind.USER_INPUT, KimiLineKind.FINAL_BULLET}
+        ),
+        default=-1,
+    )
+    return any(
+        i > boundary and kind is KimiLineKind.LIVE_SWARM_PROGRESS
+        for i, (_, _, kind) in enumerate(rows)
+    )
+
+
+def _swarm_status_context(
+    output: str,
+) -> Tuple[List[Tuple[str, str, KimiLineKind]], dict[int, KimiLineKind], Set[int]]:
+    """Retain native UI activity independently of public-output ownership.
+
+    A previous tool still owns its private payload, but that cannot certify
+    that the subsequent native swarm has finished. Status can conservatively
+    retain a structurally confirmed panel without publishing any of its rows
+    or using a payload-shaped panel to accept a new dispatch.
+    """
+    rows = classify_lines(output, SpinnerSemantics.CODE, include_unclosed_fences=True)
+    capture_has_sgr = bool(_SGR_RE.search(output))
+    raws = [raw for raw, _, _ in rows]
+    cleans = [clean for _, clean, _ in rows]
+    initial_kinds = [classify_line(raw, clean, SpinnerSemantics.CODE) for raw, clean, _ in rows]
+    quoted: Set[int] = set()
+    boundaries = (
+        [0]
+        + [
+            i
+            for i, (raw, clean, kind) in enumerate(rows)
+            if i
+            and kind is KimiLineKind.USER_INPUT
+            and is_user_input_start(
+                raw, clean, SpinnerSemantics.CODE, capture_has_sgr=capture_has_sgr
+            )
+        ]
+        + [len(rows)]
+    )
+    for start, end in zip(boundaries, boundaries[1:]):
+        scan = [
+            _answer_fence_scan_text(raws[i], cleans[i], initial_kinds[i], SpinnerSemantics.CODE)
+            for i in range(start, end)
+        ]
+        quoted.update(start + i for i in _quoted_row_indices(scan, include_unclosed=True))
+    return rows, _swarm_progress_rows(raws, cleans, quoted), quoted
+
+
+def _current_final_response_indices(
+    rows: Sequence[Tuple[str, str, KimiLineKind]],
+    quoted: Set[int],
+) -> Set[int]:
+    indices: Set[int] = set()
+    for index, (raw, clean, kind) in enumerate(rows):
+        if not FINAL_ANSWER_BULLET_STYLE_RE.search(raw):
+            continue
+        if kind is KimiLineKind.FINAL_BULLET and index not in quoted:
+            indices.add(index)
+        elif (
+            kind in ANSWER_KINDS
+            and index in quoted
+            and index - 1 not in quoted
+            and _FENCE_RE.match(
+                _answer_fence_scan_text(
+                    raw, clean, classify_line(raw, clean), SpinnerSemantics.CODE
+                )
+            )
+        ):
+            # The renderer's final bullet can introduce a Markdown fence. The
+            # answer owns that opener; quoted bullets inside it do not qualify.
+            indices.add(index)
+    return indices
+
+
+def has_current_final_response(output: str, *, minimum_row: int = 0) -> bool:
+    """Confirm a public main answer after the current submission and panel."""
+    rows, panels, quoted = _swarm_status_context(output)
+    boundary = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    boundary = max(
+        boundary,
+        max(
+            (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.TOOL_CALL),
+            default=-1,
+        ),
+        max(
+            (
+                i
+                for i, kind in panels.items()
+                if kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
+            ),
+            default=-1,
+        ),
+    )
+    return any(
+        i > boundary and i >= minimum_row for i in _current_final_response_indices(rows, quoted)
+    )
+
+
+def has_active_swarm_panel(output: str) -> bool:
+    """A structurally current native panel still has running children."""
+    rows, panels, _ = _swarm_status_context(output)
+    boundary = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    current = [
+        kind
+        for i, kind in panels.items()
+        if i > boundary and kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
+    ]
+    return bool(current and current[-1] is KimiLineKind.LIVE_SWARM_PROGRESS)
+
+
+def swarm_pane_is_quoted_suffix(pane: str, proof: str) -> bool:
+    """Map a visible panel and its surrounding rows to a retained quoted suffix.
+
+    A panel header alone cannot establish correspondence. Require the complete
+    nonblank viewport suffix, including any closing fence and footer, and the
+    retained ownership of every panel row.
+    """
+    pane_rows, pane_panels, _ = _swarm_status_context(normalize_activity_rows(pane))
+    proof_rows, _, quoted = _swarm_status_context(proof)
+    visible = [(i, clean.strip()) for i, (_, clean, _) in enumerate(pane_rows) if clean.strip()]
+    retained = [(i, clean.strip()) for i, (_, clean, _) in enumerate(proof_rows) if clean.strip()]
+    if not pane_panels or len(visible) < 3 or len(visible) > len(retained):
+        return False
+    suffix = retained[-len(visible) :]
+    return all(
+        text == retained_text for (_, text), (_, retained_text) in zip(visible, suffix)
+    ) and all(
+        retained_index in quoted
+        for (pane_index, _), (retained_index, _) in zip(visible, suffix)
+        if pane_index in pane_panels
+    )
+
+
+def has_final_before_swarm_panel(output: str) -> bool:
+    """A later batch cannot reuse a main answer preceding its own panel."""
+    rows, panels, quoted = _swarm_status_context(output)
+    boundary = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    last_panel = max(
+        (
+            i
+            for i, kind in panels.items()
+            if i > boundary
+            and kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
+        ),
+        default=-1,
+    )
+    last_panel = max(
+        last_panel,
+        max(
+            (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.TOOL_CALL),
+            default=-1,
+        ),
+    )
+    return any(boundary < i < last_panel for i in _current_final_response_indices(rows, quoted))
+
+
+def swarm_turn_pending(output: str) -> Optional[bool]:
+    """A completed child batch still precedes the main agent's final answer."""
+    rows, panels, quoted = _swarm_status_context(output)
+    boundary = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    last_panel = max(
+        (
+            i
+            for i, kind in panels.items()
+            if i > boundary
+            and kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
+        ),
+        default=-1,
+    )
+    if last_panel < 0:
+        return None
+    last_panel = max(
+        last_panel,
+        max(
+            (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.TOOL_CALL),
+            default=-1,
+        ),
+    )
+    return not any(i > last_panel for i in _current_final_response_indices(rows, quoted))
 
 
 def classify_rows(
@@ -1803,16 +2116,23 @@ def classify_rows(
             for index, raw in enumerate(raws)
         ]
 
+    # tmux capture-pane -e can omit SGR on individual default-colour rows.
+    # Only a wholly unstyled capture can use the text-only ❯ fallback.
+    capture_has_sgr = semantics is SpinnerSemantics.CODE and any(
+        _SGR_RE.search(raw) for raw in raws
+    )
+    submission_starts = [
+        is_user_input_start(raw, clean, semantics, capture_has_sgr=capture_has_sgr)
+        for raw, clean in zip(raws, cleans)
+    ]
     kinds = [classify_line(raw, clean, semantics) for raw, clean in zip(raws, cleans)]
-    kinds = _confirm_context_kinds(raws, cleans, kinds, semantics)
+    kinds = _confirm_context_kinds(raws, cleans, kinds, submission_starts)
     # The last positively identified submission starts the current turn. Renderer
     # evidence for the composer is scoped to it, so a historical turn's composer
     # cannot change how the current turn's rows are read (the historical-prefix
     # invariant).
-    turn_start = 0
-    for index, (raw, clean) in enumerate(zip(raws, cleans)):
-        if is_user_input_start(raw, clean, semantics):
-            turn_start = index
+    submission_indices = [i for i, starts in enumerate(submission_starts) if starts]
+    turn_start = submission_indices[-1] if submission_indices else 0
     kinds = _confirm_ready_frames(raws, cleans, kinds, semantics, turn_start)
 
     result: List[KimiLineKind] = []
@@ -1824,15 +2144,7 @@ def classify_rows(
     # Execution probes also quarantine unfinished fences: later bytes may close
     # them, but an acceptance latch cannot be revoked once it has fired.
     quoted: Set[int] = set()
-    boundaries = (
-        [0]
-        + [
-            i
-            for i, (raw, clean) in enumerate(zip(raws, cleans))
-            if i and is_user_input_start(raw, clean, semantics)
-        ]
-        + [len(cleans)]
-    )
+    boundaries = [0] + [i for i in submission_indices if i] + [len(cleans)]
     for start, end in zip(boundaries, boundaries[1:]):
         fence_scan_lines = [
             _answer_fence_scan_text(raws[i], cleans[i], kinds[i], semantics)
@@ -1843,6 +2155,9 @@ def classify_rows(
             for i in _quoted_row_indices(fence_scan_lines, include_unclosed=include_unclosed_fences)
         )
     in_answer_fence = False
+    swarm_rows = (
+        _swarm_progress_rows(raws, cleans, quoted) if semantics is SpinnerSemantics.CODE else {}
+    )
 
     for index, (raw, clean, kind) in enumerate(zip(raws, cleans, kinds)):
         stripped = clean.strip()
@@ -1857,7 +2172,7 @@ def classify_rows(
         # after it was published as the answer. The escape-free fallback that lets
         # a plain sparkle start a submission is still available where no private
         # block is open (the shape the screen/status consumers see).
-        starts_submission = is_user_input_start(raw, clean, semantics) and not (
+        starts_submission = submission_starts[index] and not (
             in_tool_block
             and semantics is SpinnerSemantics.CODE
             and USER_INPUT_COLOR_INDEX not in foreground_color_indices(raw)
@@ -1878,6 +2193,11 @@ def classify_rows(
             if _FENCE_RE.match(clean):
                 in_answer_fence = index + 1 in quoted
             continue
+
+        # Native panels do not open a generic tool-payload block. Conversely,
+        # a panel-shaped payload cannot release an already established block.
+        if index in swarm_rows and not in_tool_block:
+            kind = swarm_rows[index]
 
         if in_user_echo:
             # Positive evidence: the submitted message's own styling. It survives
@@ -1918,6 +2238,11 @@ def classify_rows(
         ):
             in_answer_fence = True
             result.append(KimiLineKind.CONTENT)
+            continue
+
+        if index in swarm_rows and not in_tool_block:
+            in_reasoning = False
+            result.append(kind)
             continue
 
         # --- tool output: opens on a positive tool header, and while it is open it
@@ -1989,7 +2314,10 @@ def classify_lines(
     raw_lines = (script_output or "").split("\n")
     clean_lines = [strip_sgr(raw) for raw in raw_lines]
     kinds = classify_rows(
-        raw_lines, clean_lines, semantics, include_unclosed_fences=include_unclosed_fences
+        raw_lines,
+        clean_lines,
+        semantics,
+        include_unclosed_fences=include_unclosed_fences,
     )
     return [(raw, clean, kind) for raw, clean, kind in zip(raw_lines, clean_lines, kinds)]
 

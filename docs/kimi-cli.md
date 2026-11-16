@@ -22,9 +22,13 @@ supports both from one provider:
 
 Dialect selection is capability-based: CAO never infers a dialect from a
 version number. The CODE path was validated end-to-end against Kimi Code
-**0.43.1**. (A later local install, Kimi Code 2.0.0, still exposes the same
-capability flags in `--help`; that is a limited observation, not full
-2.0.0 TUI/E2E support.)
+**0.43.1**. Compatibility handling also covers Kimi Code **2.3**'s `❯`
+submission marker and renamed workspace-trust choices. The original local
+compatibility checks against **2.3.3** exercised workspace trust and multi-turn
+requests with text and tool output; synthetic regression fixtures cover
+completion and extraction edge cases. These checks do not establish full 2.3
+provider E2E coverage. A Kimi Code 2.0.0 install was only checked for the same
+capability flags in `--help`, not full 2.0.0 TUI/E2E support.
 
 ## Prerequisites
 
@@ -51,6 +55,46 @@ cao launch --agents code_supervisor --provider kimi_cli
 ```
 
 The dialect is detected automatically; no configuration selects it.
+
+## Native Swarm Mode
+
+Kimi Code profiles can set `kimiSwarm: true` to enter native swarm mode before
+the first task, or `kimiSwarm: false` to skip automatic activation. Omission
+inherits the operator's `CAO_KIMI_SWARM_DEFAULT` setting, which is off unless
+explicitly enabled. This is a mode setting: it does not add `AgentSwarm` or any
+other tool to a native `tools` allowlist. A read-only profile keeps its existing
+runtime tool restrictions.
+
+`kimiSwarmMaxConcurrency` accepts integers from 1 to 10. The operator's bounded
+runtime policy defaults to 10 concurrent subagents per `AgentSwarm` batch, not
+10 total subagents over the session and not a shared budget across CAO workers.
+A smaller limit captured from the launch shell is preserved. Setting
+`kimiSwarm: false` does not bypass that resource policy; tool-triggered swarms
+remain capped when their tool is available.
+
+The native Kimi 2.1.1 retry scheduler did not enforce its environment concurrency
+limit after provider rate limits. Enabling this policy therefore requires an
+executable whose retry path has been fixed and tested. Set
+`CAO_KIMI_SWARM_CAP_SHA256` on the CAO server to that executable's SHA256, and set
+`CAO_KIMI_SWARM_DEFAULT=1` to enable startup swarm by default. CAO verifies the
+actual launch-shell-resolved executable before every managed native launch and
+refuses a replacement that does not match. An explicit profile limit also
+requires verification. Unconfigured default-off launches retain their prior
+behavior without claiming an enforced cap.
+
+CAO runs `/swarm on` as a startup control command and requires Kimi's native
+activation confirmation before delivering work. It does not count this command
+or its status bullet as an executed task. Legacy Kimi CLI behavior is unchanged.
+
+For completion attribution, CAO retains the current generation's raw transcript
+in an anonymous spool, using at most 64 KiB before spilling to temporary disk.
+It closes the spool on the next dispatch, buffer-generation reset, or terminal
+cleanup. This preserves quoted and private-output ownership after the rolling
+buffer is cropped. Final-answer verification may temporarily read the complete
+generation, so very large turns require disk and transient memory proportional
+to that turn's output. If recording fails, CAO discards cached completion
+evidence and requires a new generation before trusting a final-answer proof.
+An active live panel takes precedence over an older recorded completion.
 
 ## Dialect Detection
 
@@ -95,6 +139,41 @@ Rules that matter:
   and probe and exec still refer to the same file.
 
 ## Kimi Code Path
+
+### Completion and Message Extraction
+
+For the measured 2.3 submission layout (`❯`), CAO checks the current visible
+pane before confirming a ready-looking turn. The pane must show the ready
+status/footer and boxed composer, with no live spinner or active trust or
+permission dialog. Finishing a tool call or displaying answer text does not
+override a visible spinner, active dialog or non-ready pane. These checks use
+observable terminal output, not an independent signal of the model's internal
+state.
+
+When those readiness checks pass and a publishable final answer is available
+for this turn (after its latest tool call, if any), the turn can become
+**COMPLETED** without an extra delay. A turn can also finish with only tool output
+or reasoning, and no final text. In that case, CAO waits for the visible
+transcript above the ready composer to remain unchanged for **2 seconds**
+before reporting **COMPLETED**. Cursor-only redraws and changes to the custom
+status line below the composer do not restart the wait. A transcript change or
+new generation restarts it, and a live spinner, active dialog or non-ready pane
+cannot age into completion. The interval is a readiness check, not a task timeout.
+Each status verdict is still discarded if output arrives during detection.
+Continuous redraws faster than a status poll can therefore delay completion
+until a poll finishes between writes, even though the settle observation is retained.
+
+Completion and answer availability are separate: `get_output` with `mode=last`
+still reports an extraction error when there is no publishable final answer or
+no reliable answer boundary. It does not substitute reasoning, tool-only output,
+an earlier answer or the echoed prompt. Synchronous `cao session send` reports
+an answer-fetch failure and exits **1**; Ctrl-C while waiting still exits **130**.
+
+This additional settle check is selected by the recorded `❯` submission
+grammar, not by a version-number comparison. Older CODE submissions using `✨`
+retain their existing completion behavior, including when the answer has
+scrolled out of the visible pane; they do not acquire the 2-second wait. The
+[legacy TUI status rules](#status-detection) are unchanged.
 
 ### Working Directory
 
@@ -183,12 +262,18 @@ symlinked home rather than following it.
 
 ### Workspace Trust — inherit one, or opt in to all
 
-Kimi Code refuses to run in an untrusted folder. Measured against 0.43.1:
+Kimi Code refuses to run in an untrusted folder. CAO recognizes both measured
+sets of trust-dialog labels:
 
-| Selection | Result |
-|---|---|
-| **Don't trust** | **the process exits immediately** (exit 0). No TUI, no turn. |
-| **Trust this folder** | full function; trust recorded for that folder |
+| Choice | 0.43.1 label | 2.3 label |
+|---|---|---|
+| Grant workspace trust | **Trust this folder** | **Trust and continue** |
+| Decline workspace trust | **Don't trust** | **Exit** |
+
+On 0.43.1, choosing **Don't trust** was measured to exit the process immediately
+with exit code 0: no TUI and no turn. Choosing the trust option allows Kimi to
+run and records trust for that folder. The renamed 2.3 labels do not change
+CAO's explicit opt-in policy below.
 
 Because the dialog fires for **any** untrusted cwd — even a repository with no
 project MCP files — and because CAO builds a fresh `KIMI_CODE_HOME` per
@@ -211,10 +296,10 @@ There are two supported ways to resolve it, and they are not equivalent.
 #### Option A — pre-trust one workspace (preferred)
 
 Run normal `kimi` once in that repository, using your usual `KIMI_CODE_HOME`,
-and choose **Trust this folder**:
+and choose **Trust this folder** (0.43.1) or **Trust and continue** (2.3):
 
 ```bash
-cd /path/to/repo && kimi      # then choose "Trust this folder"
+cd /path/to/repo && kimi      # then choose the workspace-trust option
 ```
 
 Kimi records the decision in `$KIMI_CODE_HOME/workspace-trust/`. Every later CAO
@@ -259,9 +344,10 @@ as opaque.
 When opted in, the handler is still **positive-identification only**: the exact
 dialog must be present (title + navigation hint + a recognised option set), the
 workspace the dialog names must equal the pane's actual working directory, and
-the selection must be readable. If the selection is already *Trust this folder*
-it is accepted; otherwise CAO navigates deterministically, re-reads the pane,
-verifies the marker moved, and only then sends Enter. Any other outcome —
+the selection must be readable. CAO normalizes *Trust and continue* to
+*Trust this folder* and *Exit* to *Don't trust*. If the trust option is already
+selected it is accepted; otherwise CAO navigates deterministically, re-reads
+the pane, verifies the marker moved, and only then sends Enter. Any other outcome —
 unknown layout, unreadable selection, mismatched workspace — fails closed
 without sending a key. A blind Enter is never sent.
 
@@ -555,6 +641,22 @@ substring rule truncates any answer that quotes them:
 connecting to mcp servers is only a phrase   <- must survive
 Final line                                   <- must survive
 ```
+
+Boot-message punctuation/whitespace suffixes are separate from arbitrary
+detail fields. Where a detail field accepts a trailing-newline suffix, the
+newline boundary prevents the two fields from repeatedly matching the same
+whitespace. MCP count digits and optional collapsed-output bullets likewise
+avoid overlapping repetitions. Existing punctuation, Unicode whitespace,
+trailing-newline behavior, and both bullet glyphs remain accepted; this does
+not add a transcript-length limit or change the distinction between answer
+content and chrome.
+
+Footer tips are checked within individual escape-delimited segments carrying
+the footer colour; a later colour or reset cannot lend its text to an earlier
+segment. Native swarm status parsing matches the existing glyph/state prefix
+and reads its detail separately, without overlapping whitespace repetitions.
+It rejects embedded newlines at the row boundary while preserving the panel,
+colour, and quoted-content checks.
 
 ### Terminal Output Format (v1.20.0+, legacy)
 

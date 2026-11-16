@@ -4,6 +4,8 @@ import { api, ApiError, TemplateSummary, ProfileValidationMessage, ProviderInfo 
 import { ValidationFindings } from './ValidationFindings'
 import { CustomSelect, SelectOption } from './CustomSelect'
 import { useGeneration } from '../hooks/useGeneration'
+import { ProfileParamsEditor } from './ProfileParamsEditor'
+import { hasParamRowErrors, writeParamsBlock, type ParamRow } from './profileParams'
 import { AlertTriangle, ChevronDown, ChevronRight, Loader2, Package, X } from 'lucide-react'
 
 /** Debounce for the template live preview, matching the search box contract. */
@@ -16,6 +18,15 @@ export const PREVIEW_DEBOUNCE_MS = 300
  * their types always come from `GET /agents/profiles/schema`.
  */
 const PRIMARY_FIELDS = ['name', 'description', 'provider', 'model', 'tags', 'capabilities']
+
+/**
+ * Fields with their own section in the from-scratch form, after System
+ * prompt, instead of a place under Advanced. `params` has the Params editor.
+ */
+const SECTION_FIELDS = ['params']
+
+/** A schema field that renders under Advanced. */
+const isAdvancedField = (k: string) => k !== 'name' && !PRIMARY_FIELDS.includes(k) && !SECTION_FIELDS.includes(k)
 
 /**
  * Datalist suggestions for the `role` field: the built-in tool-bundle roles
@@ -91,7 +102,7 @@ function FieldLabel({ name, required, description }: { name: string; required?: 
 }
 
 const inputClass =
-  'w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-emerald-600'
+  'w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:outline-hidden focus:border-emerald-600'
 
 /**
  * One schema-driven field. Strings with enums render as selects; booleans as
@@ -134,7 +145,7 @@ function SchemaField({
   // error is nested inside it.
   // border-2 + !important red + ring: visibly thick and immune to losing the
   // border-color specificity contest against inputClass's border-gray-700.
-  const errClass = hasError ? ' border-2 !border-red-500 ring-2 ring-red-500/30' : ''
+  const errClass = hasError ? ' border-2 border-red-500! ring-2 ring-red-500/30' : ''
   if (selectOptions) {
     return (
       <div>
@@ -172,7 +183,7 @@ function SchemaField({
           type="checkbox"
           checked={Boolean(value)}
           onChange={e => onChange(name, e.target.checked ? true : undefined)}
-          className="rounded bg-gray-900 border-gray-700"
+          className="rounded-sm bg-gray-900 border-gray-700"
         />
         <FieldLabel name={name} required={required} description={schema.description} />
       </div>
@@ -230,7 +241,7 @@ function SchemaField({
           // pretty-printed once; edits then flow through as strings.
           value={typeof value === 'string' ? value : value ? JSON.stringify(value, null, 2) : ''}
           onChange={e => onChange(name, e.target.value)}
-          className={`${inputClass} font-mono text-xs ${err || hasError ? 'border-2 !border-red-500 ring-2 ring-red-500/30' : ''}`}
+          className={`${inputClass} font-mono text-xs ${err || hasError ? 'border-2 border-red-500! ring-2 ring-red-500/30' : ''}`}
           placeholder="{ }"
         />
         {err && <div className="text-xs text-red-400 mt-1" role="alert">{err}</div>}
@@ -335,6 +346,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const [scratchValues, setScratchValues] = useState<Record<string, unknown>>({})
   const [jsonDrafts, setJsonDrafts] = useState<Record<string, string>>({})
   const [systemPrompt, setSystemPrompt] = useState('')
+  const [paramRows, setParamRows] = useState<ParamRow[]>([])
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
   // Reset per open so a cancelled create never leaks into the next one.
@@ -355,6 +367,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     setScratchValues({})
     setJsonDrafts({})
     setSystemPrompt('')
+    setParamRows([])
     setAdvancedOpen(false)
     nameTouched.current = false
     // Staleness token: these three fetches are idempotent, but a rapid
@@ -504,8 +517,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   // paint a red boundary nobody can see; expand the section so it is visible.
   useEffect(() => {
     if (!profileSchema || errorFields.size === 0) return
-    const advanced = Object.keys((profileSchema.properties ?? {}) as Record<string, unknown>)
-      .filter(k => k !== 'name' && !PRIMARY_FIELDS.includes(k))
+    const advanced = Object.keys((profileSchema.properties ?? {}) as Record<string, unknown>).filter(isAdvancedField)
     if (advanced.some(k => errorFields.has(k))) setAdvancedOpen(true)
   }, [errorFields, profileSchema])
 
@@ -533,7 +545,9 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
   const scratchProps = (profileSchema?.properties ?? {}) as Record<string, JSONSchemaProp>
   const scratchRequired = new Set<string>((profileSchema?.required as string[]) ?? [])
   const primaryKeys = PRIMARY_FIELDS.filter(k => k in scratchProps && k !== 'name')
-  const advancedKeys = Object.keys(scratchProps).filter(k => k !== 'name' && !PRIMARY_FIELDS.includes(k))
+  const advancedKeys = Object.keys(scratchProps).filter(isAdvancedField)
+  // The Params section shows when the server schema declares params.
+  const paramsInSchema = 'params' in scratchProps
 
   // Provider select options from the live registry. Uninstalled providers
   // stay selectable — a profile may target a provider absent on this machine.
@@ -572,7 +586,13 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     for (const [k, draft] of Object.entries(jsonDrafts)) {
       if (draft.trim() !== '' && !jsonErrors[k]) values[k] = JSON.parse(draft)
     }
-    return buildFrontmatter(values) + '\n' + (systemPrompt.trim() ? systemPrompt.trim() + '\n' : '')
+    // The params block goes last, just before the closing ---. buildFrontmatter
+    // always ends with that line.
+    const frontmatter = buildFrontmatter(values)
+    const params = paramsInSchema ? writeParamsBlock(paramRows) : ''
+    const closing = '---\n'
+    return frontmatter.slice(0, frontmatter.length - closing.length) + params + closing +
+      '\n' + (systemPrompt.trim() ? systemPrompt.trim() + '\n' : '')
   }
 
   const canCreate =
@@ -580,7 +600,9 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     !saving &&
     // In template mode the POST body is the preview, so a create mid-debounce
     // would persist a stale render; wait for the in-flight preview to settle.
-    (mode === 'template' ? preview !== null && !previewLoading : Object.keys(jsonErrors).length === 0)
+    (mode === 'template'
+      ? preview !== null && !previewLoading
+      : Object.keys(jsonErrors).length === 0 && !(paramsInSchema && hasParamRowErrors(paramRows)))
 
   const handleCreate = async () => {
     // Ref-based guard: two synchronous clicks before the re-render both
@@ -646,12 +668,12 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
     }`
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center" role="dialog" aria-label="Create profile">
+    <div className="fixed inset-0 z-60 flex items-center justify-center" role="dialog" aria-label="Create profile">
       {/* Backdrop close is gated on !saving: Cancel is already disabled
           during a save, and an overlay click mid-flight would unmount the
           modal while the request resolves — success snackbar with no modal,
           setState on an unmounted tree. */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={saving ? undefined : onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-xs" onClick={saving ? undefined : onClose} />
       <div className="relative bg-gray-900 border border-gray-700/50 rounded-2xl shadow-2xl w-full max-w-3xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-3 p-5 pb-3 border-b border-gray-800">
@@ -674,7 +696,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
           {/* Gated like Cancel and the backdrop: closing mid-save leaves the
               modal rendering null, so a late 400's saveError is invisible and
               then wiped by the next open's reset (#692 review). */}
-          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded transition-colors disabled:opacity-50">
+          <button onClick={saving ? undefined : onClose} disabled={saving} aria-label="Close" className="p-1 text-gray-500 hover:text-white rounded-sm transition-colors disabled:opacity-50">
             <X size={16} />
           </button>
         </div>
@@ -690,7 +712,7 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
               type="text"
               value={profileName}
               onChange={e => { nameTouched.current = true; clearBlockedSave(); setProfileName(e.target.value) }}
-              className={inputClass + (errorFields.has('name') ? ' border-2 !border-red-500 ring-2 ring-red-500/30' : '')}
+              className={inputClass + (errorFields.has('name') ? ' border-2 border-red-500! ring-2 ring-red-500/30' : '')}
               placeholder="my-agent"
             />
           </div>
@@ -804,6 +826,15 @@ export function ProfileCreateModal({ open, onClose, onCreated }: ProfileCreateMo
                       placeholder="# You are…"
                     />
                   </div>
+
+                  {paramsInSchema && (
+                    <ProfileParamsEditor
+                      rows={paramRows}
+                      onChange={rows => { clearBlockedSave(); setParamRows(rows) }}
+                      suggestFrom={systemPrompt}
+                      invalid={errorFields.has('params')}
+                    />
+                  )}
 
                   <div className="border border-gray-800 rounded-lg">
                     <button

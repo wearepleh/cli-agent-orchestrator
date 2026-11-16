@@ -26,12 +26,13 @@ under the *nested* schema described in issue #357.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.services.vault.config import VaultConfig
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +62,34 @@ class ServerConfig(BaseModel):
     startup_prompt_handler_timeout: int = 20
 
 
+class LifecycleConfig(BaseModel):
+    enabled: bool = False
+
+
+class RankingConfig(BaseModel):
+    default_sort: Literal["recency", "bm25"] = "recency"
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
+    explain_enabled: bool = True
+    non_accessing_inspection: bool = False
+    lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
+    ranking: RankingConfig = Field(default_factory=RankingConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
     lint_enabled: bool = True
     vault: VaultConfig = Field(default_factory=VaultConfig)
+
+
+class KeepFinishedConfig(BaseModel):
+    """``terminal.keep_finished`` (#1225 phase 1). Validated by settings_service."""
+
+    enabled: bool = False
+    idle_window_minutes: int = 60
+    max_per_session: int = 5
+    on_cap: str = "teardown_oldest"
 
 
 class TerminalConfig(BaseModel):
@@ -76,6 +98,7 @@ class TerminalConfig(BaseModel):
     spawn_mode: str = "window"
     pane_window: str = "cao-agents"
     pane_layout: str = "tiled"
+    keep_finished: KeepFinishedConfig = Field(default_factory=KeepFinishedConfig)
 
 
 class AppsConfig(BaseModel):
@@ -160,6 +183,11 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.spawn_mode": "window",
     "terminal.pane_window": "cao-agents",
     "terminal.pane_layout": "tiled",
+    # #1225 phase 1: the four keys of the keep-finished block, defaults shown.
+    "terminal.keep_finished.enabled": False,
+    "terminal.keep_finished.idle_window_minutes": 60,
+    "terminal.keep_finished.max_per_session": 5,
+    "terminal.keep_finished.on_cap": "teardown_oldest",
     "apps.enabled": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
@@ -193,6 +221,9 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
     "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
+    "CAO_MEMORY_EXPLAIN_ENABLED": ("memory.explain_enabled", "bool", True),
+    "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", False),
+    "CAO_MEMORY_LIFECYCLE_ENABLED": ("memory.lifecycle.enabled", "bool", False),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
@@ -254,7 +285,7 @@ def _settings_file() -> Path:
     return settings_service.SETTINGS_FILE
 
 
-def _load_raw() -> Dict[str, Any]:
+def _load_raw(*, strict: bool = False) -> Dict[str, Any]:
     """Load the unified settings file, migrating legacy config.json in place.
 
     On first run after upgrading, if a legacy ``config.json`` exists and the
@@ -263,26 +294,61 @@ def _load_raw() -> Dict[str, Any]:
     ``terminal`` and the move is logged. ``config.json`` itself is left on
     disk (untouched) but is no longer read once migrated.
 
-    This is a plain read-modify-write with no file lock: it assumes a single
-    CAO process touches ``settings.json`` at a time (the same assumption
-    ``settings_service._load``/``_save`` already make). A concurrent ``set()``
-    from a second process during migration could be lost. Acceptable for a
-    single-operator local tool; would need a lock (e.g. ``filelock``) if CAO
-    ever supports multiple concurrent writers to the same settings file.
+    Publication uses the same target-derived lock and atomic replace as
+    ``settings_service._save``. The read and write are still separate
+    operations, so a concurrent ``set()`` from a second process during
+    migration could be lost.
+
+    With ``strict`` the loader raises ``SettingsUnreadableError`` when
+    settings.json is PRESENT but cannot be read or parsed, instead of
+    answering ``{}``. Writers must pass it (GH #737): the lenient answer is
+    indistinguishable from "no settings yet", so a caller that mutates it and
+    saves publishes an empty file over the user's real one. ``strict`` still
+    merges the legacy migration into the returned dict (so a strict writer's
+    own publish carries it forward under the same lock), but does not persist
+    it itself — persisting a partial ``terminal`` object independently of a
+    strict writer's own update would permanently block the migration (GH
+    #737 follow-up).
     """
     global _migration_logged
 
+    from cli_agent_orchestrator.services import settings_service
+
     settings_file = _settings_file()
     data: Dict[str, Any] = {}
-    if settings_file.exists():
+    unreadable = False
+    try:
+        raw = settings_file.read_text()
+    except FileNotFoundError:
+        raw = None
+    except (OSError, UnicodeDecodeError) as e:
+        if strict:
+            raise settings_service.SettingsUnreadableError(settings_file, e) from e
+        logger.warning(f"Failed to read {settings_file}: {e}")
+        raw, unreadable = None, True
+    if raw is not None:
         try:
-            loaded = json.loads(settings_file.read_text())
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception as e:
+            loaded = json.loads(raw)
+        except ValueError as e:
+            if strict:
+                raise settings_service.SettingsUnreadableError(settings_file, e) from e
             logger.warning(f"Failed to read {settings_file}: {e}")
+            loaded, unreadable = None, True
+        if isinstance(loaded, dict):
+            data = loaded
+        else:
+            e2 = TypeError(f"expected a JSON object, got {type(loaded).__name__}")
+            if strict:
+                raise settings_service.SettingsUnreadableError(settings_file, e2)
+            logger.warning(f"Failed to read {settings_file}: {e2}")
+            unreadable = True
 
-    if "terminal" not in data and LEGACY_CONFIG_FILE.exists():
+    # Never migrate on top of a file we could not read: the migration writes
+    # (in non-strict mode) or merges into data a strict writer is about to
+    # publish, and either way unknown content must not be silently discarded.
+    # Reached only when the loader did not already raise above, so `data` is
+    # a real parse result (or {}) and `unreadable` is False here.
+    if not unreadable and "terminal" not in data and LEGACY_CONFIG_FILE.exists():
         try:
             legacy = json.loads(LEGACY_CONFIG_FILE.read_text())
         except Exception as e:
@@ -296,7 +362,12 @@ def _load_raw() -> Dict[str, Any]:
                 terminal_section["herdr_session"] = legacy["herdr_session"]
             if terminal_section:
                 data["terminal"] = terminal_section
-                _save_raw(data)
+                # In strict mode (called from _mutate_raw's compute), the
+                # merged data is persisted by the enclosing writer's own
+                # publish under the same lock — persisting it here too would
+                # be a second, independent write to the same file.
+                if not strict:
+                    _save_raw(data)
                 if not _migration_logged:
                     logger.info(
                         f"Migrated legacy {LEGACY_CONFIG_FILE} into {settings_file} "
@@ -308,9 +379,55 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _save_raw(data: Dict[str, Any]) -> None:
+    """Write the unified settings file.
+
+    Same writer, same lock and same 0600 mode as ``settings_service._save``:
+    ``cao config set`` is the second writer of ``settings.json`` (every key the
+    settings service does not own, e.g. ``terminal.backend``), so it must give
+    the same guarantees. The file is published atomically and private, a
+    symlink planted at the path is replaced rather than followed, and the two
+    writers serialize on the one lock instead of clobbering each other.
+    """
     settings_file = _settings_file()
     settings_file.parent.mkdir(parents=True, exist_ok=True)
-    settings_file.write_text(json.dumps(data, indent=2))
+    locked_atomic_write(settings_file, json.dumps(data, indent=2), mode=0o600)
+
+
+def _mutate_raw(update: Callable[[Dict[str, Any]], None]) -> None:
+    """Fail-closed, locked read-modify-write of the unified settings file.
+
+    The ``_load_raw`` / mutate / ``_save_raw`` pair this replaces destroyed
+    data (GH #737): a settings.json with a single trailing comma loaded as
+    ``{}``, ``cao config set logging.level INFO`` added its one key to that,
+    and ``_save_raw`` published a four-line file over the user's. The load and
+    the save also took the lock separately, so two concurrent setters each
+    published their own view and the later one won whole.
+
+    ``update`` mutates the parsed settings in place while the lock is held.
+    An absent file still starts from ``{}``; a present-but-unreadable one
+    raises ``settings_service.SettingsUnreadableError`` before ``update``
+    runs, leaving the file byte-identical.
+    """
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_file = _settings_file()
+
+    def compute(_existing: str) -> str:
+        # Re-read strictly rather than parsing ``_existing``: the helper hands
+        # us "" for both absent and unreadable, which is the distinction that
+        # has to fail closed here.
+        data = _load_raw(strict=True)
+        update(data)
+        return json.dumps(data, indent=2)
+
+    try:
+        locked_atomic_rewrite(settings_file, compute, mode=0o600)
+    except (OSError, UnicodeDecodeError) as e:
+        # locked_atomic_rewrite reads the file before calling compute, so
+        # undecodable bytes or OS-level read failures (permission denied,
+        # the path being a directory, ...) surface from there, ahead of our
+        # strict read.
+        raise settings_service.SettingsUnreadableError(settings_file, e) from e
 
 
 def _get_from_file(path: str) -> Any:
@@ -346,6 +463,11 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "server":
         return settings_service.get_server_settings().get(key, default)
     if section == "memory":
+        if key == "lifecycle.enabled":
+            return settings_service.is_memory_lifecycle_enabled()
+        if key == "ranking.default_sort":
+            ranking = settings_service.get_memory_settings().get("ranking", {})
+            return ranking.get("default_sort", default) if isinstance(ranking, dict) else default
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":
@@ -372,6 +494,20 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     if override is not None:
         return override
 
+    if path in {
+        "memory.explain_enabled",
+        "memory.non_accessing_inspection",
+        "memory.lifecycle.enabled",
+    }:
+        from cli_agent_orchestrator.services import settings_service
+
+        helpers = {
+            "memory.explain_enabled": settings_service.is_memory_explain_enabled,
+            "memory.non_accessing_inspection": settings_service.is_non_accessing_inspection_enabled,
+            "memory.lifecycle.enabled": settings_service.is_memory_lifecycle_enabled,
+        }
+        return helpers[path]()
+
     if path == "memory.lint_enabled":
         from cli_agent_orchestrator.services import settings_service
 
@@ -380,7 +516,7 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
         from cli_agent_orchestrator.services import settings_service
 
         try:
-            vault = settings_service.get_vault_config()
+            vault = settings_service.get_vault_config(canonicalize=False)
         except ValueError as exc:
             logger.warning("Invalid vault configuration disabled for config lookup: %s", exc)
             vault = VaultConfig()
@@ -434,33 +570,60 @@ def _set_value(path: str, value: Any) -> Any:
         return settings_service.set_agent_dirs({provider: value})
     if path == "agents.roles" or path.startswith("agents.roles."):
         # Write both nested and flat for backward compat
-        data = _load_raw()
-        if path == "agents.roles":
-            roles = value
-        else:
-            role_name = path.split(".", 2)[2]
-            roles = data.get("roles", {})
-            if not isinstance(roles, dict):
-                roles = {}
-            roles[role_name] = value
-        # Nested format
-        agents_section = data.get("agents", {})
-        if not isinstance(agents_section, dict):
-            agents_section = {}
-        agents_section["roles"] = roles
-        data["agents"] = agents_section
-        # Flat format
-        data["roles"] = roles
-        _save_raw(data)
+        roles: Any = {}
+
+        def update_roles(data: Dict[str, Any]) -> None:
+            nonlocal roles
+            if path == "agents.roles":
+                roles = value
+            else:
+                role_name = path.split(".", 2)[2]
+                roles = data.get("roles", {})
+                if not isinstance(roles, dict):
+                    roles = {}
+                roles[role_name] = value
+            # Nested format
+            agents_section = data.get("agents", {})
+            if not isinstance(agents_section, dict):
+                agents_section = {}
+            agents_section["roles"] = roles
+            data["agents"] = agents_section
+            # Flat format
+            data["roles"] = roles
+
+        _mutate_raw(update_roles)
         return roles
     if path.startswith("memory."):
         key = path.split(".", 1)[1]
         return settings_service.set_memory_setting(key, value)
+    if path == "terminal" or path.startswith(settings_service.KEEP_FINISHED_SETTING):
+        return _set_keep_finished_value(path, value)
 
     keys = _LEGACY_KEY_MAP.get(path, tuple(path.split(".")))
-    data = _load_raw()
-    _set_nested(data, keys, value)
-    _save_raw(data)
+    _mutate_raw(lambda data: _set_nested(data, keys, value))
+    return value
+
+
+def _set_keep_finished_value(path: str, value: Any) -> Any:
+    """Write a ``terminal.keep_finished`` value only if the whole block stays valid.
+
+    The block is checked as it WOULD be after the write, under the settings lock,
+    and a bad value raises ``KeepFinishedSettingsError`` before anything is
+    published: ``cao config set`` then exits non-zero with the reason and the file
+    is unchanged (#1225: refuse bad values with a clear message).
+    """
+    from cli_agent_orchestrator.services import settings_service
+
+    keys = tuple(path.split("."))
+
+    def update(data: Dict[str, Any]) -> None:
+        _set_nested(data, keys, value)
+        terminal = data.get("terminal")
+        if not isinstance(terminal, dict):
+            raise settings_service.KeepFinishedSettingsError("terminal must be an object")
+        settings_service.parse_keep_finished_block(terminal.get("keep_finished"))
+
+    _mutate_raw(update)
     return value
 
 
@@ -481,9 +644,25 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.ranking.default_sort",
         "memory.vault",
+        "terminal.keep_finished.enabled",
+        "terminal.keep_finished.idle_window_minutes",
+        "terminal.keep_finished.max_per_session",
+        "terminal.keep_finished.on_cap",
     }
 )
+
+
+def _keep_finished_config() -> KeepFinishedConfig:
+    """The resolved keep-finished block; an invalid one reads as off, as the server does."""
+    from cli_agent_orchestrator.services import settings_service
+
+    try:
+        return KeepFinishedConfig(**settings_service.get_keep_finished_settings()._asdict())
+    except settings_service.KeepFinishedSettingsError as exc:
+        logger.warning("%s; keeping finished agents is off until it is fixed", exc)
+        return KeepFinishedConfig()
 
 
 class ConfigService:
@@ -529,6 +708,8 @@ class ConfigService:
     @staticmethod
     def get_config() -> CAOConfig:
         """Assemble and validate the full typed config from resolved values."""
+        from cli_agent_orchestrator.services import settings_service
+
         return CAOConfig(
             agents=AgentsConfig(
                 dirs=_get_value("agents.dirs", default={}),
@@ -549,6 +730,12 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
+                explain_enabled=settings_service.is_memory_explain_enabled(),
+                non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
+                lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
+                ranking=RankingConfig(
+                    default_sort=_get_value("memory.ranking.default_sort", default="recency")
+                ),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
@@ -561,6 +748,7 @@ class ConfigService:
                 spawn_mode=_get_value("terminal.spawn_mode", default="window"),
                 pane_window=_get_value("terminal.pane_window", default="cao-agents"),
                 pane_layout=_get_value("terminal.pane_layout", default="tiled"),
+                keep_finished=_keep_finished_config(),
             ),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),

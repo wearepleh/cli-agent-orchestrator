@@ -18,18 +18,30 @@
  * A relative `--base` such as `./` cannot work for runtime calls and is not
  * supported; use an absolute prefix.
  */
+import { tokenQuery, withAuth } from './auth'
+
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
 
-/** URL for the terminal's xterm WebSocket, honouring BASE. */
+/**
+ * URL for the terminal's xterm WebSocket, honouring BASE. Carries the stored
+ * bearer as `?token=` when one is set: a browser cannot put a header on a
+ * WebSocket handshake, and the server accepts the token from that query
+ * parameter (and redacts it from its access log).
+ */
 export function terminalSocketUrl(terminalId: string): string {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws`
+  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws${tokenQuery('token', false)}`
 }
 
-/** URL for a workflow run's SSE event stream, honouring BASE. */
+/**
+ * URL for a workflow run's SSE event stream, honouring BASE. Carries the stored
+ * bearer as `?access_token=` when one is set, which is what the route accepts
+ * for clients that cannot send headers; the `fetch`-based follower sends the
+ * header as well.
+ */
 export function eventStreamUrl(runId: string, afterSeq?: number): string {
   const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
-  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}${tokenQuery('access_token', q !== '')}`
 }
 
 /**
@@ -46,11 +58,41 @@ export interface ApiError extends Error {
   detailMeta?: Record<string, unknown>
 }
 
+/**
+ * The text of a list `detail`, such as FastAPI's 422 body or a plain list of
+ * messages: each string item, or the `msg` or `message` of each object item,
+ * one per line. Undefined when no item has text.
+ */
+function listDetailText(items: unknown[]): string | undefined {
+  const lines: string[] = []
+  for (const item of items) {
+    const entry = item && typeof item === 'object' ? (item as { msg?: unknown; message?: unknown }) : null
+    const text = typeof item === 'string' ? item : entry ? (entry.msg ?? entry.message) : undefined
+    if (typeof text === 'string' && text !== '') lines.push(text)
+  }
+  return lines.length > 0 ? lines.join('\n') : undefined
+}
+
+/**
+ * The server's explanation of a failed request, for display: `detail`, then
+ * each string in an object detail's `errors` list that `detail` does not
+ * already hold, one per line. Undefined when the server sent neither.
+ */
+export function errorDetailText(err: Pick<ApiError, 'detail' | 'detailMeta'> | null | undefined): string | undefined {
+  const detail = typeof err?.detail === 'string' ? err.detail : ''
+  const listed = err?.detailMeta && !Array.isArray(err.detailMeta) ? err.detailMeta.errors : undefined
+  const extra = Array.isArray(listed)
+    ? listed.filter((e): e is string => typeof e === 'string' && e !== '' && !detail.includes(e))
+    : []
+  const lines = [detail, ...extra].filter(line => line !== '')
+  return lines.length > 0 ? lines.join('\n') : undefined
+}
+
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
-    const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
+    const res = await fetch(`${BASE}${url}`, { ...opts, headers: withAuth(opts?.headers), signal: controller.signal })
     if (!res.ok) {
       // Best-effort read of the JSON error body to expose the server's
       // `detail` without leaking a full response. A non-JSON body is fine —
@@ -61,6 +103,8 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
       try {
         const body = await res.json()
         if (body && typeof body.detail === 'string') detail = body.detail
+        // A list detail reads as its messages, not as a bare status.
+        if (body && Array.isArray(body.detail)) detail = listDetailText(body.detail)
         if (body && body.detail && typeof body.detail === 'object') {
           detailMeta = body.detail as Record<string, unknown>
           if (typeof detailMeta.message === 'string') detail = detailMeta.message
@@ -90,6 +134,147 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
   }
 }
 
+/** Shape of `GET /health`. Only the fields this client reads are declared. */
+export interface HealthInfo {
+  status: string
+  service?: string
+  terminal_backend?: string
+  /** The init budget the SERVER applies, in seconds (#1002 P3-1). Absent on an older server. */
+  provider_init_timeout?: number
+  components?: Record<string, string>
+  /** The server's installed package version. Absent on an older server. */
+  version?: string
+}
+
+// ── Create budgets, sized from the server's provider_init_timeout ───────────
+// Issues #710, #1002.
+//
+// `POST /sessions` (without `initial_message`), `POST /sessions/{name}/terminals`
+// and `POST /flows/{name}/run` are answered only AFTER the server finishes
+// `provider.initialize()`. The budget such a call needs is a function of the
+// value the server is itself waiting out — `server.provider_init_timeout` — and
+// of nothing else. These three carried a flat 90 s, which is below a SUCCESSFUL
+// Antigravity init at stock settings (430 s, see below): the browser aborted and
+// showed a failure while the server went on building the worker, the same defect
+// #710 reported for the CLI.
+//
+// #1002 fixed the Python clients by routing every create through
+// `utils/init_allowance.synchronous_create_timeout`, and added an AST lint
+// (`test/test_synchronous_create_timeout_boundary.py`) that fails any new fixed
+// literal on a create call. That lint cannot see TypeScript, so
+// `web/src/test/create-budget.test.ts` is its web-side equivalent: it enumerates
+// the create call sites by name, requires each to reach its budget through
+// `createBudgetMs()`, and fails on a `timeoutMs` literal.
+
+/**
+ * Budget used when `GET /health` cannot be read, or reports no
+ * `provider_init_timeout` because the server predates #1002.
+ *
+ * 90_000 is the fixed literal these three calls carried before the budget
+ * became derived, kept exactly so an unreachable or older server leaves the UI
+ * behaving as it did rather than changing two things at once.
+ */
+export const FALLBACK_CREATE_BUDGET_MS = 90000
+
+/**
+ * Budget for the `/health` read itself. Deliberately well under the 10 s
+ * default: it sits in front of every create, and a server that cannot answer a
+ * trivial localhost GET promptly is not one whose init budget is worth waiting
+ * for — the create falls back and proceeds.
+ */
+const HEALTH_READ_BUDGET_MS = 5000
+
+// The constants below mirror `cli_agent_orchestrator/utils/init_allowance.py`
+// and the two provider modules it reads, so this client and the Python clients
+// derive the SAME number from the same `provider_init_timeout`. They are
+// duplicated because the browser cannot import Python; the drift guard is
+// `create-budget.test.ts`, which reads all three Python sources and fails if any
+// of these values stops matching.
+//
+// `_INIT_PHASES`: a successful init legitimately spans several T-bounded phases;
+// the longest linear shape is ~3T, and the fourth T is margin.
+const INIT_PHASES = 4
+// `_DELIVERY_CONFIRM_ALLOWANCE`: the server's confirm-and-resubmit loop after a
+// send, with headroom for pre-dispatch work and polling.
+const DELIVERY_CONFIRM_ALLOWANCE_S = 60
+// `antigravity_cli.SHELL_WAIT_TIMEOUT_S` / `READY_TIMEOUT_FLOOR_S`.
+const ANTIGRAVITY_SHELL_WAIT_S = 10
+const ANTIGRAVITY_READY_FLOOR_S = 180
+// `kimi_cli.READY_TIMEOUT_FLOOR_S`.
+const KIMI_READY_FLOOR_S = 120
+
+/**
+ * Milliseconds a client should allow for server-side init plus delivery
+ * confirmation, given the server's `provider_init_timeout` in seconds.
+ *
+ * The port of `init_allowance.init_allowance`: the largest of the linear
+ * `INIT_PHASES * T` bound and the two fixed-floor provider shapes, so a
+ * successful init on any known shape of provider stays inside the budget, then
+ * the delivery-confirmation headroom on top. Both floor shapes exceed the
+ * linear bound at stock settings — at T=60 Antigravity needs
+ * `10 + 2*180 = 370 s` against a linear 240 s — which is precisely why a flat
+ * literal could not be right.
+ *
+ * `Math.trunc` rather than `Math.round`, matching the Python `int(bound)`.
+ */
+export function initAllowanceMs(providerInitTimeoutS: number): number {
+  const t = providerInitTimeoutS
+  const bound = Math.max(
+    INIT_PHASES * t,
+    ANTIGRAVITY_SHELL_WAIT_S + 2 * Math.max(ANTIGRAVITY_READY_FLOOR_S, t),
+    t + 2 * Math.max(KIMI_READY_FLOOR_S, t),
+  )
+  return (Math.trunc(bound) + DELIVERY_CONFIRM_ALLOWANCE_S) * 1000
+}
+
+/**
+ * Cached derived budget. `provider_init_timeout` is server configuration, so one
+ * read per page load is enough; a reload picks up a change.
+ *
+ * Only a SUCCESSFUL read is cached. Caching a failure would pin the 90 s
+ * fallback for the lifetime of the page over one transient blip, and the cost of
+ * retrying is a 5 s GET in front of an operation that takes minutes.
+ */
+let cachedCreateBudgetMs: number | null = null
+let inFlightHealthRead: Promise<number> | null = null
+
+/**
+ * Client deadline (ms) for a create the server answers only after init.
+ *
+ * Every create call site in this module takes its budget from here. Never write
+ * a literal on one: raising `provider_init_timeout` has to move the client
+ * deadline with it, which is the whole defect in #710.
+ *
+ * Known limit: the Python helper also honours a PROFILE-level
+ * `provider_init_timeout` override, which `GET /health` does not report — the UI
+ * sizes from the server's global value only. A profile that overrides it ABOVE
+ * the global is therefore still under-budgeted here, which is the pre-existing
+ * behaviour and not a regression.
+ */
+export async function createBudgetMs(): Promise<number> {
+  if (cachedCreateBudgetMs !== null) return cachedCreateBudgetMs
+  if (inFlightHealthRead !== null) return inFlightHealthRead
+
+  const read = (async (): Promise<number> => {
+    try {
+      const health = await fetchJSON<HealthInfo>('/health', { timeoutMs: HEALTH_READ_BUDGET_MS })
+      const timeout = health?.provider_init_timeout
+      if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0) {
+        return FALLBACK_CREATE_BUDGET_MS
+      }
+      cachedCreateBudgetMs = initAllowanceMs(timeout)
+      return cachedCreateBudgetMs
+    } catch {
+      // Sizing a wait must never fail the call it is sizing.
+      return FALLBACK_CREATE_BUDGET_MS
+    } finally {
+      inFlightHealthRead = null
+    }
+  })()
+  inFlightHealthRead = read
+  return read
+}
+
 export interface Session {
   id: string
   name: string
@@ -97,6 +282,7 @@ export interface Session {
 }
 
 export interface Terminal {
+  description: string | null
   id: string
   name: string
   provider: string
@@ -112,13 +298,18 @@ export interface SessionDetail {
 }
 
 export interface TerminalMeta {
+  description: string | null
   id: string
+  pending_inbox_count?: number
   tmux_session: string
   tmux_window: string
   provider: string
   agent_profile: string | null
   created_at: string | null
   last_active: string | null
+  /** Live status, lowercase (`idle`, `processing`, ...). Set by GET /sessions/{name}
+      from the status monitor; absent on other routes that return terminal rows. */
+  status?: string | null
 }
 
 /**
@@ -156,11 +347,26 @@ export interface ProfileSearchResult {
 }
 
 /**
+ * One entry of a profile's `params` block: a param that a workflow step using
+ * the profile fills in. A missing `type` means `string` and a missing
+ * `required` means `false`. `default`, `description` and `enum` are present
+ * only when the profile sets them. An int default is a number and a bool
+ * default is a boolean.
+ */
+export interface ProfileParamDecl {
+  type?: 'string' | 'int' | 'bool'
+  required?: boolean
+  default?: string | number | boolean
+  description?: string
+  enum?: Array<string | number>
+}
+
+/**
  * Parsed profile from `GET /agents/profiles/{name}`. This response is
  * *resolved* (env-var placeholders substituted) — fine for display, but an
  * editor must load `GET /agents/profiles/{name}/source` instead so a save
- * never persists resolved secrets. Only the fields the detail pane renders
- * are declared; the endpoint returns the full model with nulls excluded.
+ * never persists resolved secrets. Only the fields this client reads are
+ * declared; the endpoint returns the full model with nulls excluded.
  */
 export interface AgentProfileDetail {
   name: string
@@ -170,6 +376,8 @@ export interface AgentProfileDetail {
   role?: string
   tags?: string[]
   capabilities?: string[]
+  /** The params a workflow step must fill, in declaration order. */
+  params?: Record<string, ProfileParamDecl>
 }
 
 /** One scaffold template from `GET /agents/profiles/templates`. `name` is `category/name`. */
@@ -191,6 +399,14 @@ export interface ProfileValidationMessage {
 export interface ProfileValidationResponse {
   valid: boolean
   messages: ProfileValidationMessage[]
+  /**
+   * The params block the validator read from the submitted text, as written
+   * (a `${X}` stays `${X}`), in declaration order. An object, possibly empty,
+   * when the frontmatter has a `params` key and the validator reports no
+   * error for it. null when there is no `params` key, the block has errors,
+   * or the document has an error that stopped the checks.
+   */
+  params?: Record<string, ProfileParamDecl> | null
 }
 
 /**
@@ -353,6 +569,19 @@ export interface GapMarker {
   reason: string
 }
 
+/**
+ * A step's saved final answer: the step row's `result_json` envelope as the
+ * inspection returns it. `text` is the agent's last message, with secrets
+ * redacted and capped by the server; `truncated` and `redacted` say whether
+ * either happened.
+ */
+export interface StepResultEnvelope {
+  text: string
+  status: string
+  truncated: boolean
+  redacted: boolean
+}
+
 /** One step's durable projection inside a RunInspection (server StepInspection). */
 export interface StepInspection {
   id: string
@@ -361,9 +590,38 @@ export interface StepInspection {
   output_json?: string | null
   error?: string | null
   error_kind?: string | null
+  /** Set while the step runs, from the moment its terminal exists. */
   terminal_id?: string | null
   reprompted?: number | null
   call_fingerprint?: string | null
+  /** The saved final answer, or null when the row has none (an older run, or a step that has not settled). */
+  result?: StepResultEnvelope | null
+}
+
+/**
+ * `GET /workflows/runs/{run_id}/steps/{step_id}/screen`: a read-only capture of
+ * a running step's screen as plain text, with secrets redacted. 410 once the
+ * step's terminal has ended.
+ */
+export interface StepScreen {
+  terminal_id: string
+  text: string
+  truncated: boolean
+  redacted: boolean
+  /** ISO-8601 UTC time of the capture. */
+  captured_at: string
+}
+
+/**
+ * `GET /workflows/runs/{run_id}/steps/{step_id}/transcript`: the saved
+ * transcript of a finished step, with secrets redacted. 404 until the file
+ * exists, and after retention deletes it.
+ */
+export interface StepTranscript {
+  terminal_id: string
+  text: string
+  truncated: boolean
+  redacted: boolean
 }
 
 /** Enriched single-run inspection (server RunInspection, FR-5.1). */
@@ -494,6 +752,242 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+/** Read-only fleet summary from `GET /fleet/status`. */
+export interface FleetStatus {
+  broker: string
+  live: number
+  cleanup_pending: number
+  states: Record<string, number>
+}
+
+/** One broker inventory row from `GET /fleet/workers` (server-side allowlisted). */
+export interface FleetWorker {
+  worker_id: string
+  state: string
+  reason: string | null
+  agent_profile: string | null
+  provider: string | null
+  age_seconds: number | null
+  workload_present: boolean
+  cleanup_pending: boolean
+  lease_tracked: boolean
+}
+
+export interface FleetWorkerList {
+  broker: string
+  workers: FleetWorker[]
+}
+
+/** `GET /fleet/workers/{id}`: the `cao worker status` view. */
+export interface FleetWorkerDetail {
+  worker_id: string
+  lease: FleetWorker | null
+  terminal: {
+    id: string
+    name: string | null
+    session_name: string | null
+    agent_profile: string | null
+    provider: string | null
+    status: string | null
+  } | null
+  terminal_error: string | null
+  last_output: string | null
+}
+
+/**
+ * Optional, deployment-supplied UI presets, read from `ui-presets.json` next to
+ * the built UI (a provisioning step drops it into web/public before the build).
+ * Absent on a plain install, which is the common case: every field is optional
+ * and a missing or malformed file means "no presets".
+ */
+export interface UiPresets {
+  prompts?: { label: string; text: string }[]
+  installs?: { label: string; source: string; provider?: string }[]
+}
+
+/** Result of `POST /agents/profiles/install` (server InstallResult). */
+export interface InstallResult {
+  success: boolean
+  message: string
+  agent_name?: string | null
+  context_file?: string | null
+  agent_file?: string | null
+  unresolved_vars?: string[] | null
+  source_kind?: 'url' | 'file' | 'name' | null
+  provider?: string | null
+}
+
+/**
+ * One indexed workflow DEFINITION from `GET /workflows` (server WorkflowIndexRow,
+ * models/workflow_runtime.py). Distinct from a run (RunSummaryRow). Consumed by
+ * the web UI's workflow launcher, which runs a stored workflow from the UI —
+ * the `cao workflow run` equivalent.
+ */
+export interface WorkflowDefRow {
+  name: string
+  source_path: string
+  mode: string
+  step_count: number | null
+  description: string
+  indexed_at: string
+}
+
+/**
+ * The 202 ack from `POST /workflows/runs:submit` — the run is durably journaled
+ * and driven in the background; poll the run list / inspect for progress.
+ */
+export interface WorkflowRunAck {
+  run_id: string
+  state: string
+  links?: Record<string, string>
+}
+
+/**
+ * Result of `POST /workflows/plans/approve` (issue #583). Idempotent: `changed`
+ * is false when the plan was already approved, with the ORIGINAL approval time.
+ */
+export interface PlanApproval {
+  plan_id: string
+  approved: boolean
+  changed: boolean
+  approved_at?: string
+  approved_by?: string
+}
+
+/** One script-lint finding (server LintFinding). `line` is 1-based. */
+export interface WorkflowLintFinding {
+  rule_id: string
+  severity: 'error' | 'warning'
+  line: number
+  message: string
+}
+
+/** `POST /workflows/validate` result (server ValidationResult / ScriptValidationResult). */
+export interface WorkflowValidation {
+  status: 'pass' | 'pass_reserved' | 'fail'
+  errors: string[]
+  reserved_notes?: string[]
+  findings?: WorkflowLintFinding[]
+}
+
+/** One step of a run's retained result (server StepResult). */
+export interface WorkflowStepResult {
+  id: string
+  state: string
+  attempts: number
+  output?: Record<string, unknown> | null
+  error?: string | null
+  error_kind?: string | null
+}
+
+/**
+ * `GET /workflows/runs/{id}/result` (server WorkflowRunResult). Journal-built, so
+ * there is no run-level output; per-step outputs carry what a run emitted. A
+ * failed/cancelled run adds `failure_envelope`.
+ */
+export interface WorkflowRunResult {
+  run_id: string
+  workflow_name: string
+  state: string
+  steps: WorkflowStepResult[]
+  started_at: string
+  finished_at?: string | null
+  kind?: string | null
+  warnings?: string[]
+  failure_envelope?: Record<string, unknown>
+}
+
+/** The call a step's orchestrator makes. Only `handoff` runs today; the other two are reserved. */
+export type WorkflowStepCall = 'handoff' | 'assign' | 'send_message'
+
+/** The spec format a write or a source validation targets. The server defaults to `python`. */
+export type WorkflowTier = 'python' | 'yaml'
+
+/** One declared run input (server InputDecl). */
+export interface WorkflowInputDecl {
+  type: 'string' | 'int' | 'bool' | 'path'
+  required?: boolean
+  default?: string | number | boolean | null
+}
+
+/**
+ * One step of a YAML spec as the server parsed it (server WorkflowStep). The
+ * response is a `model_dump()`, so an unset field arrives as null.
+ */
+export interface WorkflowSpecStep {
+  id: string
+  provider: string
+  agent: string
+  prompt: string
+  /** null means handoff. */
+  call?: WorkflowStepCall | null
+  /** Literal strings, appended to the step prompt in declaration order. */
+  params?: Record<string, string> | null
+  retries?: number | null
+  on_failure?: 'halt' | 'continue' | null
+  engine?: string | null
+  output_schema?: Record<string, unknown> | null
+  when?: string | null
+  until?: string | null
+  max_iterations?: number | null
+  on_stall?: string | null
+  on_no_progress?: string | null
+  [key: string]: unknown
+}
+
+/**
+ * `GET /workflows/{name}`. A script workflow is the server's ScriptSpec (path,
+ * source, hash, findings, inputs). A YAML workflow is the parsed WorkflowSpec
+ * (description, mode, inputs, steps) plus `path`, `source` and `content_hash`.
+ */
+export interface WorkflowSpec {
+  name: string
+  description?: string
+  mode?: string
+  path?: string
+  source?: string
+  content_hash?: string
+  findings?: WorkflowLintFinding[]
+  inputs?: Record<string, WorkflowInputDecl>
+  steps?: WorkflowSpecStep[]
+  [key: string]: unknown
+}
+
+/**
+ * Result of `POST /workflows` (201) and `PUT /workflows/{name}` (200).
+ * `status` and `reserved_notes` come back for a YAML write only.
+ */
+export interface WorkflowWriteResult {
+  name: string
+  path: string
+  content_hash: string
+  findings: WorkflowLintFinding[]
+  status?: 'pass' | 'pass_reserved'
+  reserved_notes?: string[]
+}
+
+/** A run input that names a report file (`GET /workflows/runs/{id}/artifacts`). */
+export interface WorkflowArtifactRef {
+  input: string
+  path: string
+  available: boolean
+  size: number | null
+}
+
+export interface WorkflowArtifactList {
+  run_id: string
+  artifacts: WorkflowArtifactRef[]
+}
+
+/** `GET /workflows/runs/{id}/artifacts/{input}`: the report text. */
+export interface WorkflowArtifact {
+  run_id: string
+  input: string
+  path: string
+  size: number
+  content: string
+}
+
 // ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
 // Distinct from CAO's event-plugin system, which has no web surface.
 
@@ -574,6 +1068,9 @@ export interface PluginInstallBody {
   force?: boolean
 }
 
+export let sessionDescriptionRevision = 0
+export const SESSION_DESCRIPTION_READ_ATTEMPTS = 3
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -646,9 +1143,26 @@ export const api = {
 
   // Sessions
   listSessions: () => fetchJSON<Session[]>('/sessions'),
-  getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${name}`),
-  createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
+  getSession: async (name: string): Promise<SessionDetail> => {
+    // Never return a pre-edit response, but let a future poll recover if edits
+    // keep invalidating every read instead of keeping this request alive forever.
+    for (let attempt = 0; attempt < SESSION_DESCRIPTION_READ_ATTEMPTS; attempt++) {
+      const revision = sessionDescriptionRevision
+      const detail = await fetchJSON<SessionDetail>(`/sessions/${name}`)
+      if (revision === sessionDescriptionRevision) return detail
+    }
+    throw new Error('Session descriptions kept changing; retry on the next poll')
+  },
+  // Synchronous create: no `initial_message`, so the server holds the response
+  // until provider.initialize() returns. Budget from createBudgetMs(), never a
+  // literal (#710, #1002).
+  // `create_working_directory=true` rides along with a typed path (#724): the
+  // operator picked a folder in the launch form, so a folder that does not
+  // exist yet is a request to create it, not a mistake to report. The server
+  // defaults the flag to false, which is what keeps the MCP tools' fail-fast
+  // contract intact -- they send nothing.
+  createSession: async (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
+    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}&create_working_directory=true` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
   deleteSession: async (name: string) => {
     const result = await fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' })
     if (!result?.success || (result.errors && result.errors.length > 0)) {
@@ -661,6 +1175,15 @@ export const api = {
   },
 
   // Terminals
+  updateTerminalDescription: async (id: string, description: string | null) => {
+    const terminal = await fetchJSON<Terminal>(`/terminals/${encodeURIComponent(id)}/description`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description }),
+    })
+    sessionDescriptionRevision++
+    return terminal
+  },
   getTerminalStatus: (id: string) =>
     fetchJSON<Terminal>(`/terminals/${id}`).then(t => t.status),
   getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>
@@ -681,8 +1204,17 @@ export const api = {
   },
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
-  addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
+  // Synchronous create: no `defer_init`, so the server holds the response until
+  // provider.initialize() returns. Budget from createBudgetMs() (#710, #1002).
+  // The operator form of the in-session create. `POST /sessions/{name}/terminals`
+  // is the agents' route and requires caller_id (403 without it); the UI has no
+  // delegating terminal, so it uses the distinct `:operator` sub-path, which the
+  // server records like a `POST /sessions` launch. test/api/test_web_client_contract.py
+  // posts this exact shape at the real route, so a server-side tightening that
+  // breaks this button fails CI instead of the browser.
+  // `create_working_directory=true` as in createSession above (#724).
+  addTerminalToSession: async (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
+    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals:operator?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}&create_working_directory=true` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
 
   // Inbox
   getInboxMessages: (terminalId: string, limit?: number, status?: string) =>
@@ -702,7 +1234,11 @@ export const api = {
   deleteFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}`, { method: 'DELETE' }),
   enableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/enable`, { method: 'POST' }),
   disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/disable`, { method: 'POST' }),
-  runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: 90000 }),
+  // An on-demand flow run launches a session behind this one POST, so it waits
+  // out the same provider init as a create. Budget from createBudgetMs()
+  // (#710, #1002). `createFlow` above only writes the flow file and keeps its
+  // own literal.
+  runFlow: async (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: await createBudgetMs() }),
 
   // Memory
   getMemoryStatus: () => fetchJSON<MemoryStatus>('/settings/memory'),
@@ -760,12 +1296,28 @@ export const api = {
   // ── Workflow run journal (Issue #504 / U8) — read + delete over the
   // already-built durable-journal APIs. All additive; no server code here.
 
-  // #505's run list (FINAL RunSummaryRow shape). Consumed, not built.
-  listWorkflowRuns: () => fetchJSON<RunSummaryRow[]>('/workflows/runs'),
+  // #505's run list (FINAL RunSummaryRow shape). Consumed, not built. `limit`
+  // is optional; without it the server returns its default page of 50.
+  listWorkflowRuns: (limit?: number) =>
+    fetchJSON<RunSummaryRow[]>(`/workflows/runs${limit != null ? `?limit=${limit}` : ''}`),
 
   // U3 inspect — enriched single-run projection (journal-authoritative).
   inspectWorkflowRun: (runId: string) =>
     fetchJSON<RunInspection>(`/workflows/runs/${encodeURIComponent(runId)}`),
+
+  // A running step's screen as plain text: a read-only capture, so polling it
+  // never attaches to, resizes or types into the agent's terminal. 410 once the
+  // step's terminal has ended; read the transcript then.
+  getWorkflowStepScreen: (runId: string, stepId: string) =>
+    fetchJSON<StepScreen>(
+      `/workflows/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/screen`,
+    ),
+
+  // A finished step's saved transcript. 404 while the file does not exist yet.
+  getWorkflowStepTranscript: (runId: string, stepId: string) =>
+    fetchJSON<StepTranscript>(
+      `/workflows/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}/transcript`,
+    ),
 
   // U3/U4 batch event page. `afterSeq` is the replay/next-page cursor (events
   // with seq strictly greater); omit to read from the start of the timeline.
@@ -792,6 +1344,178 @@ export const api = {
   // (fetchJSON returns undefined). Idempotent server-side (unknown id -> 204).
   deleteWorkflowRun: (runId: string) =>
     fetchJSON<void>(`/workflows/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+
+  // Read-only fleet summary (`cao fleet status`). 503 when no broker is configured or it
+  // is unreachable — the caller renders that as "fleet not reachable".
+  getFleetStatus: () => fetchJSON<FleetStatus>('/fleet/status'),
+
+  // Worker inventory (`cao worker list`; `all` = include settled leases) and one
+  // worker's lease + terminal + last output (`cao worker status`). Read-only.
+  listFleetWorkers: (all = false) =>
+    fetchJSON<FleetWorkerList>(`/fleet/workers${all ? '?all=true' : ''}`),
+  getFleetWorker: (workerId: string) =>
+    fetchJSON<FleetWorkerDetail>(`/fleet/workers/${encodeURIComponent(workerId)}`),
+
+  // Deployment presets (see UiPresets). Never rejects: any failure is "none".
+  getUiPresets: async (): Promise<UiPresets> => {
+    try {
+      const data = await fetchJSON<unknown>('/ui-presets.json')
+      if (!data || typeof data !== 'object') return {}
+      const d = data as Record<string, unknown>
+      const prompts = Array.isArray(d.prompts)
+        ? d.prompts.filter((p: any) => p && typeof p.label === 'string' && typeof p.text === 'string')
+        : undefined
+      const installs = Array.isArray(d.installs)
+        ? d.installs.filter((p: any) => p && typeof p.label === 'string' && typeof p.source === 'string')
+        : undefined
+      return { prompts, installs }
+    } catch {
+      return {}
+    }
+  },
+
+  // Install an agent profile (POST /agents/profiles/install) — the `cao install`
+  // equivalent. `source` is a built-in profile name or an https:// URL (the
+  // server refuses local paths); `provider` defaults to the profile's
+  // frontmatter when omitted (same flag > frontmatter > default order as the CLI).
+  installProfile: (source: string, provider?: string) =>
+    fetchJSON<InstallResult>('/agents/profiles/install', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(provider ? { source, provider } : { source }),
+      timeoutMs: 30000,
+    }),
+
+  // GET /health, for the Home tab's server card (backend, components, version).
+  getHealth: () => fetchJSON<HealthInfo>('/health'),
+
+  // Download one memory scope as an OKF tarball (GET /memory/export). The server
+  // refuses private scopes and needs scope_id for project. Returns the blob and
+  // a filename so the caller can hand it to the browser; errors surface as
+  // ApiError like fetchJSON's.
+  exportMemory: async (opts: { scope: string; scopeId?: string; redact?: boolean }) => {
+    const q = new URLSearchParams({ scope: opts.scope })
+    if (opts.scopeId) q.set('scope_id', opts.scopeId)
+    if (opts.redact) q.set('redact', 'true')
+    const res = await fetch(`${BASE}/memory/export?${q}`, { headers: withAuth() })
+    if (!res.ok) {
+      const err: ApiError = new Error(`${res.status} ${res.statusText}`)
+      err.status = res.status
+      try {
+        const body = await res.json()
+        if (body && typeof body.detail === 'string') err.detail = body.detail
+      } catch { /* non-JSON error body */ }
+      throw err
+    }
+    return { blob: await res.blob(), filename: `cao-memory-${opts.scope}.tar.gz` }
+  },
+
+  // ── Workflow run controls — the write side over the existing run-control
+  // endpoints: the UI equivalents of `cao workflow run/cancel/resume`.
+
+  // Indexed workflow definitions, for the launcher's workflow picker.
+  listWorkflows: () => fetchJSON<WorkflowDefRow[]>('/workflows'),
+
+  // Async start (202) — durably journaled, then driven in the background. We use
+  // the :submit twin (not the blocking POST /workflows/runs) because a run that
+  // drives real agents can take minutes; the run list/detail poll shows progress.
+  // `inputs` maps the workflow's declared input names to values.
+  submitWorkflowRun: (body: { name_or_path: string; inputs?: Record<string, unknown>; run_id?: string }) =>
+    fetchJSON<WorkflowRunAck>('/workflows/runs:submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+  // Approve a script-workflow plan so its runs may start (issue #583). A first
+  // run of a new plan is refused 403 with detail {kind: 'approval_required',
+  // plan_id, message}; this is the human act that clears it. plan_id travels in
+  // the body verbatim (it contains a ':'), never as a path segment.
+  approveWorkflowPlan: (planId: string) =>
+    fetchJSON<PlanApproval>('/workflows/plans/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan_id: planId }),
+    }),
+
+  // Lint a stored workflow file without running it (the `cao workflow validate`
+  // equivalent). `path` is the definition's source_path from GET /workflows.
+  validateWorkflow: (path: string) =>
+    fetchJSON<WorkflowValidation>('/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    }),
+
+  // Cooperative cancel of a running run (no body). Returns {success, run_id}.
+  cancelWorkflowRun: (runId: string) =>
+    fetchJSON<{ success: boolean; run_id: string }>(
+      `/workflows/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST' },
+    ),
+
+  // Resume a crashed/failed/cancelled run from its durable journal (optional
+  // body omitted — default resume-from-last-completed). Drives in the background.
+  resumeWorkflowRun: (runId: string) =>
+    fetchJSON<WorkflowRunAck>(
+      `/workflows/runs/${encodeURIComponent(runId)}/resume`,
+      { method: 'POST', timeoutMs: 30000 },
+    ),
+
+  // A run's retained result (the `cao workflow result` equivalent).
+  getWorkflowRunResult: (runId: string) =>
+    fetchJSON<WorkflowRunResult>(`/workflows/runs/${encodeURIComponent(runId)}/result`),
+
+  // A stored workflow's spec (the `cao workflow get` equivalent): source, hash, findings.
+  getWorkflowSpec: (name: string) =>
+    fetchJSON<WorkflowSpec>(`/workflows/${encodeURIComponent(name)}`),
+
+  // Workflow authoring, for the builder. `tier` picks the spec format and is
+  // always sent: the server defaults to python. Each write validates the spec
+  // server-side before it lands, so the writes get the same 30s budget as the
+  // profile authoring calls.
+
+  // Create a new workflow. 409 when the name exists in either tier.
+  createWorkflow: (name: string, source: string, tier: WorkflowTier) =>
+    fetchJSON<WorkflowWriteResult>('/workflows', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, source, tier }),
+      timeoutMs: 30000,
+    }),
+
+  // Replace an existing workflow. `expectedHash` is the content_hash read from
+  // GET /workflows/{name}; a stale one is a 409, so a concurrent edit is never
+  // overwritten.
+  updateWorkflow: (name: string, source: string, expectedHash: string, tier: WorkflowTier) =>
+    fetchJSON<WorkflowWriteResult>(`/workflows/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, expected_hash: expectedHash, tier }),
+      timeoutMs: 30000,
+    }),
+
+  // Delete a workflow's file and its index row (needs cao:admin).
+  deleteWorkflow: (name: string) =>
+    fetchJSON<{ success: boolean; name: string }>(`/workflows/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // Validate spec text without saving it (the source form of POST /workflows/validate).
+  validateWorkflowSource: (source: string, tier: WorkflowTier) =>
+    fetchJSON<WorkflowValidation>('/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, tier }),
+      timeoutMs: 30000,
+    }),
+
+  // Report files a run was given as inputs (e.g. report=/tmp/report.md). The
+  // server only lists/reads a .md directly in its temp dir; see docs/api.md.
+  listWorkflowArtifacts: (runId: string) =>
+    fetchJSON<WorkflowArtifactList>(`/workflows/runs/${encodeURIComponent(runId)}/artifacts`),
+  getWorkflowArtifact: (runId: string, input: string) =>
+    fetchJSON<WorkflowArtifact>(
+      `/workflows/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(input)}`,
+    ),
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null

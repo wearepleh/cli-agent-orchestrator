@@ -19,6 +19,7 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import PROVIDER_SERVER_NAME_PATTERNS
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -26,6 +27,9 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+# MiniMax Code uses qualified provider/model keys, including for API-key routing.
+MINIMAX_CODE_DEFAULT_MODEL = "minimax/MiniMax-M3"
 
 _PLUGIN_NAME = "cao-orchestrator"
 #: Imported from the delivery table rather than re-declared here: the plugin
@@ -46,7 +50,8 @@ _COMPLETION_PATTERN = re.compile(r"(?:^|\n)[^\S\n]*└\s+Completed in\s+\d", re.
 # overlapped the following `.*` on every whitespace character outside ASCII, which
 # reads as re-guessable backtracking (CWE-1333); ^-anchoring means CPython never
 # actually walked it, but the narrower classes say what the line really looks like.
-_ASSISTANT_LINE_PATTERN = re.compile(r"^(?P<indent>[^\S\n]*)●[^\S\n]+(?P<text>\S.*)$")
+ASSISTANT_MARKER_PATTERN = re.compile(r"^(?P<indent>[^\S\n]*)●[^\S\n]+")
+_ASSISTANT_LINE_PATTERN = re.compile(ASSISTANT_MARKER_PATTERN.pattern + r"(?P<text>\S.*)$")
 _READY_ASSISTANT_LINE_PATTERN = re.compile(r"^\s*●\s+Ready\s*$")
 _WAITING_PATTERN = re.compile(
     r"Approval needed|Run this command\?|Allow for this conversation|"
@@ -107,6 +112,15 @@ class ProviderError(Exception):
 class MiniMaxCodeProvider(BaseProvider):
     """Provider for the interactive ``mcode`` terminal UI."""
 
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
+
     def __init__(
         self,
         terminal_id: str,
@@ -131,6 +145,12 @@ class MiniMaxCodeProvider(BaseProvider):
 
     supports_screen_detection = True
     supports_direct_status_probe = True
+    # get_status binds COMPLETED to the dispatched turn: a completion whose
+    # identity matches the previous turn's, with no activity seen in the new
+    # buffer epoch, reports IDLE (see the ``_awaiting_turn`` branches). So a
+    # probe COMPLETED here cannot be the retained previous turn, and the inbox
+    # recovery may accept it as pickup evidence.
+    direct_status_probe_has_turn_identity = True
 
     @property
     def paste_enter_count(self) -> int:
@@ -273,8 +293,6 @@ class MiniMaxCodeProvider(BaseProvider):
 
     @staticmethod
     def _apply_model_config(data_dir: Path, model: Optional[str]) -> None:
-        if not model or not model.strip():
-            return
         config_path = data_dir / "config.yaml"
         try:
             loaded = (
@@ -288,7 +306,15 @@ class MiniMaxCodeProvider(BaseProvider):
             loaded = {}
         if not isinstance(loaded, dict):
             raise ProviderError("MiniMax Code config.yaml must contain a mapping")
-        loaded["defaultModel"] = model.strip()
+        selected = model.strip() if model else ""
+        if not selected:
+            # Leave saved selections and their provider-specific settings byte-for-byte intact.
+            if loaded.get("defaultModel"):
+                return
+            selected = MINIMAX_CODE_DEFAULT_MODEL
+        elif "/" not in selected:
+            selected = f"minimax/{selected}"
+        loaded["defaultModel"] = selected
         config_path.write_text(
             yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
@@ -304,7 +330,7 @@ class MiniMaxCodeProvider(BaseProvider):
             if isinstance(raw_config, dict)
             else raw_config.model_dump(exclude_none=True)
         )
-        config = resolve_mcp_server_config(config)
+        config = resolve_mcp_server_config(config, name=name)
         command = config.get("command")
         url = config.get("url")
         if not command and isinstance(url, str) and url:

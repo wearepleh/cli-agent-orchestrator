@@ -22,9 +22,14 @@ from typing import Dict, List, Optional, cast
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
     TerminalBackendError,
+    TerminalCleanupOutcome,
+    TerminalCleanupResult,
     TerminalNotFoundError,
 )
-from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+from cli_agent_orchestrator.constants import (
+    BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    HERDR_PANE_READ_MAX_LINES,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.forwarded_env import is_valid_env_key
 from cli_agent_orchestrator.utils.terminal_env import (
@@ -34,6 +39,15 @@ from cli_agent_orchestrator.utils.terminal_env import (
 )
 
 logger = logging.getLogger(__name__)
+
+# herdr's four resolvable agent states. Shared by ``get_native_status`` (a
+# poll) and ``HerdrInboxService`` (the event stream) so both read one mapping.
+HERDR_AGENT_STATUS_TO_TERMINAL_STATUS: Dict[str, TerminalStatus] = {
+    "working": TerminalStatus.PROCESSING,
+    "blocked": TerminalStatus.WAITING_USER_ANSWER,
+    "done": TerminalStatus.COMPLETED,
+    "idle": TerminalStatus.IDLE,
+}
 
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
 _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
@@ -86,6 +100,11 @@ _HERDR_ALLOWED_FLAGS = frozenset(
         "--workspace",
     }
 )
+
+
+def herdr_arg_is_safe(value: str) -> bool:
+    """True when ``value`` passes the herdr argument sanitizer (``_SAFE_ARG_RE``)."""
+    return _SAFE_ARG_RE.fullmatch(value) is not None
 
 
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
@@ -247,9 +266,19 @@ class HerdrBackend(TerminalBackend):
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
+                # stderr stays in the server log. The exception text travels to
+                # API clients as an HTTP 500 detail, and herdr's stderr can name
+                # local paths, socket locations and flags that a client has no
+                # business seeing.
+                logger.error(
+                    "herdr command failed (exit %s): %s\nstderr: %s",
+                    result.returncode,
+                    " ".join(cmd_display),
+                    result.stderr.strip(),
+                )
                 raise TerminalBackendError(
-                    f"herdr command failed: {' '.join(cmd_display)}\n"
-                    f"stderr: {result.stderr.strip()}"
+                    f"herdr command failed: {' '.join(cmd_display)} "
+                    f"(exit {result.returncode}; stderr is in the cao-server log)"
                 )
             return result
         except subprocess.TimeoutExpired as e:
@@ -357,6 +386,18 @@ class HerdrBackend(TerminalBackend):
 
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
+
+    def restore_session_env(self, session_name: str, key: str, launch_value: str) -> None:
+        """Nothing to restore: herdr's ``--env`` reaches only the pane it launches.
+
+        Measured on herdr 0.9.3 (#1074, provisional): a workspace created with
+        ``--env KEY=…`` gives ``KEY`` to its root pane only. Later tabs, with or
+        without an ``--env`` of their own, and a split of that root pane start
+        without it. herdr keeps no workspace environment, so a later tab gets
+        exactly what it would have had without ``launch_value``: its own
+        ``--env`` (``_build_env_args``) over the herdr server's environment.
+        """
+        logger.debug(f"restore_session_env({key}) is a no-op for herdr (session={session_name})")
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a workspace with the given label exists."""
@@ -467,6 +508,181 @@ class HerdrBackend(TerminalBackend):
             return True
         return False
 
+    def _fetch_identity_panes(self) -> Optional[List[Dict[str, object]]]:
+        """One fresh ``api snapshot``'s panes, or None when it cannot be trusted.
+
+        Identity decisions are only as good as the snapshot they read, so every
+        way the read can fail answers None rather than a partial list: non-zero
+        exit, a raising subprocess (timeout, missing binary, permissions),
+        unparseable JSON, or a shape that is not a dict with a list of pane
+        dicts. Never a cached snapshot, and never a label-derived one — a stale
+        or guessed view is exactly what turns "I could not see it" into "it is
+        gone".
+        """
+        try:
+            result = self._run_herdr(["api", "snapshot"], check=False)
+            if result.returncode != 0:
+                return None
+            data = self._parse_herdr_json(result.stdout)
+            if not isinstance(data, dict):
+                return None
+            snapshot = data.get("snapshot", data)
+            if not isinstance(snapshot, dict):
+                return None
+            panes = snapshot.get("panes")
+            if not isinstance(panes, list):
+                return None
+            typed: List[Dict[str, object]] = []
+            for pane in panes:
+                if not isinstance(pane, dict):
+                    return None
+                typed.append(pane)
+            return typed
+        except (
+            TerminalBackendError,
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            AttributeError,
+            TypeError,
+            KeyError,
+        ):
+            return None
+
+    @staticmethod
+    def _matching_panes(
+        panes: List[Dict[str, object]], terminal_id: str
+    ) -> Optional[List[Dict[str, object]]]:
+        """Panes in a snapshot carrying ``terminal_id``, or None if malformed.
+
+        A pane whose ``terminal_id`` is present but not a string is not an
+        identity this code can compare, so the whole snapshot's identity is
+        reported as malformed (None) rather than silently read as "no such
+        terminal". Missing/empty ids are ordinary non-CAO panes and are simply
+        not matches.
+        """
+        matches: List[Dict[str, object]] = []
+        for pane in panes:
+            value = pane.get("terminal_id")
+            if value is not None and not isinstance(value, str):
+                return None
+            if value == terminal_id:
+                matches.append(pane)
+        return matches
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        """Close the exact herdr pane owned by ``terminal_id`` and confirm it.
+
+        Identity comes from the pane's own ``terminal_id`` in a FRESH
+        ``api snapshot``. The workspace/tab labels are deliberately not used:
+        they are reusable, and a deferred-init tombstone routinely shares its
+        session name (and tab label) with a later, unrelated replacement. A
+        tombstone must never be torn down by label.
+
+        Duplicate matches, a match with no usable ``pane_id``, or an
+        unreadable/malformed snapshot all return ``UNKNOWN`` and close nothing.
+        ``ABSENT`` is returned only when a trustworthy snapshot enumerates no
+        pane carrying the id. A close is confirmed against a SECOND fresh
+        snapshot: absence after the attempt is ``DELETED``, continued presence is
+        ``STILL_PRESENT``, and an unconfirmable result is ``UNKNOWN``.
+
+        KNOWN LIMITATION / TOCTOU: herdr exposes no atomic compare-and-close, so
+        the pane is proven at snapshot time and closed by ``pane_id`` a moment
+        later. If that pane dies and another is created reusing the same
+        ``pane_id`` in between, the close can hit the replacement. The
+        post-close snapshot is what the caller's verdict is based on, so the
+        report stays truthful, but the window itself cannot be closed from here.
+        That is why this path is used only for destructive teardown of a
+        tombstone we already own, and why every uncertain answer stays retryable
+        instead of being recorded as reclaimed.
+        """
+        if not terminal_id:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "no terminal id to prove identity with",
+            )
+
+        panes = self._fetch_identity_panes()
+        if panes is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "herdr api snapshot unavailable or malformed; cannot prove "
+                f"terminal identity for {terminal_id}",
+            )
+
+        matches = self._matching_panes(panes, terminal_id)
+        if matches is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "a herdr pane reports a non-string terminal id; the snapshot's "
+                f"identity is untrustworthy, so absence of {terminal_id} cannot be proven",
+            )
+        if len(matches) > 1:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"{len(matches)} herdr panes report terminal id {terminal_id}; "
+                "refusing to close an ambiguous identity",
+            )
+        if not matches:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.ABSENT,
+                f"no herdr pane carries terminal id {terminal_id} in a fresh snapshot",
+            )
+
+        pane_id = matches[0].get("pane_id")
+        if not isinstance(pane_id, str) or not pane_id:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"herdr pane for terminal id {terminal_id} has no usable pane id",
+            )
+
+        if not close:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.STILL_PRESENT,
+                f"herdr pane {pane_id} carries {terminal_id}; close not requested",
+            )
+
+        close_error: Optional[str] = None
+        try:
+            result = self._run_herdr(["pane", "close", pane_id], check=False)
+            if result.returncode != 0:
+                close_error = f"pane close exited {result.returncode}"
+        except Exception as e:  # noqa: BLE001 — the confirm below decides the outcome
+            close_error = str(e)
+
+        confirmed = self._fetch_identity_panes()
+        if confirmed is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"closed herdr pane {pane_id} for {terminal_id} but could not confirm "
+                f"it is gone{'' if close_error is None else f' (close error: {close_error})'}",
+            )
+        confirmed_matches = self._matching_panes(confirmed, terminal_id)
+        if confirmed_matches is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"closed herdr pane {pane_id} for {terminal_id} but the confirming "
+                "snapshot's identity is malformed",
+            )
+        if confirmed_matches:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.STILL_PRESENT,
+                f"herdr still reports terminal id {terminal_id} after closing pane "
+                f"{pane_id}{'' if close_error is None else f' (close error: {close_error})'}",
+            )
+        return TerminalCleanupResult(
+            TerminalCleanupOutcome.DELETED,
+            f"closed herdr pane {pane_id} carrying {terminal_id}, confirmed absent in a "
+            f"fresh snapshot{'' if close_error is None else f' (close reported: {close_error})'}",
+        )
+
     # --- Input ---
 
     def _pane_is_bracketed_paste_incompatible(self, session_name: str, window_name: str) -> bool:
@@ -559,6 +775,14 @@ class HerdrBackend(TerminalBackend):
 
     # --- Output ---
 
+    @property
+    def max_history_lines(self) -> int:
+        # herdr clamps every ``pane read`` to 1000 lines server-side, whatever
+        # ``--lines`` asks for (see the constant). Reporting the real ceiling
+        # lets get_output skip its 5000-line rung here and classify an
+        # exhausted ladder against 1000, not 5000 (#728).
+        return HERDR_PANE_READ_MAX_LINES
+
     def get_history(
         self,
         session_name: str,
@@ -567,20 +791,36 @@ class HerdrBackend(TerminalBackend):
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
-        """Read pane output via herdr pane read."""
+        """Read pane output via herdr pane read.
+
+        ``join_wrapped`` is accepted for contract parity and ignored: ``herdr
+        pane read`` has no rejoin flag, so a caller gets whatever line shape
+        herdr returns. Callers that need a wrapped line intact must not rely
+        on it here (codex._find_config_rejection reassembles as context only).
+        """
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         args = ["pane", "read", pane_id]
         if visible_only:
             # herdr has no viewport/scrollback split; approximate the "current
-            # screen" contract with a small bounded recent read. In practice this
-            # arm is unreachable from the one visible_only caller (the stale-
-            # PROCESSING capture fallback): event-inbox backends return from
-            # get_status() before that fallback is reached.
+            # screen" contract with a small bounded recent read. The Kiro
+            # identity check reads the TUI header through this arm
+            # (KiroCliProvider._verify_agent_identity, #1074), so the header must
+            # be within these 50 lines. The stale-PROCESSING capture fallback
+            # never reaches it: event-inbox backends return from get_status()
+            # before that fallback.
             args.extend(["--source", "recent", "--lines", "50"])
         elif full_history:
-            pass  # no flags — returns full scrollback
+            # Ask for herdr's read ceiling explicitly. A flagless `pane read`
+            # was assumed to mean "full scrollback", but herdr defaults
+            # ``--lines`` to 80, so on the get_output ladder this rung returned
+            # 80 lines right after the 5000-line rung returned 604 (#728). And
+            # herdr clamps every read to HERDR_PANE_READ_MAX_LINES, so asking
+            # for more than that would only make the argv look deeper than the
+            # reply can be. This is the deepest read herdr offers.
+            args.extend(["--source", "recent", "--lines", str(HERDR_PANE_READ_MAX_LINES)])
         elif tail_lines:
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
         else:
@@ -718,16 +958,11 @@ class HerdrBackend(TerminalBackend):
         except (json.JSONDecodeError, AttributeError):
             return None
 
-        if agent_status == "working":
-            return TerminalStatus.PROCESSING
-        if agent_status == "blocked":
-            return TerminalStatus.WAITING_USER_ANSWER
-        if agent_status == "done":
-            return TerminalStatus.COMPLETED
-        if agent_status == "idle":
-            return TerminalStatus.IDLE
-        # "unknown" and any unrecognized value: unresolvable at backend level.
-        return None
+        # "unknown" and any unrecognized (or non-string) value: unresolvable at
+        # backend level.
+        if not isinstance(agent_status, str):
+            return None
+        return HERDR_AGENT_STATUS_TO_TERMINAL_STATUS.get(agent_status)
 
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.
@@ -906,8 +1141,8 @@ class HerdrBackend(TerminalBackend):
         """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
         Operator-forwarded vars are merged first, filtered with the same policy
-        TmuxClient applies to its ``-e`` argv (blocked prefixes, per-value byte
-        cap). The agent profile's own ``env:`` (``trusted_env``) merges next,
+        TmuxClient applies to its ``-e`` argv (blocked provider prefixes, the
+        startup-hijack keys from ``utils.forwarded_env``, per-value byte cap). The agent profile's own ``env:`` (``trusted_env``) merges next,
         and the terminal's identity (``CAO_TERMINAL_ID``, ``CAO_SESSION_NAME``)
         is assigned LAST, both through the helpers in ``utils/terminal_env``
         that the tmux backend applies too -- so neither channel can override
@@ -930,13 +1165,27 @@ class HerdrBackend(TerminalBackend):
           fails terminal creation here, before any herdr call, with the value
           redacted. The tmux backend accepts such operator values; that
           divergence predates profile env (#502) and is kept as is.
+
+        The running CAO's own address and home (``cao_server_env``) come first.
+        A pane otherwise inherits the herdr server's environment, which belongs
+        to whatever process started that server, not necessarily this CAO.
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
+        from cli_agent_orchestrator.utils.mcp_resolution import cao_server_env
 
         env: Dict[str, str] = {}
+        for key, value in cao_server_env().items():
+            if not _SAFE_ARG_RE.fullmatch(f"{key}={value}"):
+                logger.warning(
+                    "Dropping this CAO's %s from herdr pane env -- value contains "
+                    "characters the herdr arg sanitizer rejects",
+                    key,
+                )
+                continue
+            env[key] = value
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
-                logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
+                logger.warning("Dropping forwarded env var with blocked key: %s", key)
                 continue
             if not within_value_cap("forwarded", key, value):
                 continue
@@ -949,10 +1198,12 @@ class HerdrBackend(TerminalBackend):
             env[key] = value
 
         # Profile-declared env (trusted_env) merges after operator env, and the
-        # terminal's identity is written last, through the same helpers the
-        # tmux backend uses (utils/terminal_env).
+        # terminal's identity is written next, through the same helpers the
+        # tmux backend uses (utils/terminal_env). HISTFILE is forced last, so
+        # neither operator nor profile env turns shell history back on.
         merge_profile_env(env, trusted_env)
         apply_runtime_identity(env, terminal_id, session_name)
+        env["HISTFILE"] = "/dev/null"  # agent launch commands are noise
 
         args: List[str] = []
         for key, value in env.items():

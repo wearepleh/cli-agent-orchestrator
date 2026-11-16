@@ -9,10 +9,8 @@ Covers:
 """
 
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -354,21 +352,21 @@ class TestMcpRecallSearchMode:
         instance = MockService.return_value
         instance.recall = AsyncMock(return_value=[])
 
-        result = run_async(memory_recall(query="test", search_mode="bm25"))
+        _result = run_async(memory_recall(query="test", search_mode="bm25"))
 
         call_kwargs = instance.recall.call_args.kwargs
         assert call_kwargs["search_mode"] == "bm25"
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_terminal_context_from_env")
     @patch("cli_agent_orchestrator.services.memory_service.MemoryService")
-    def test_mcp_recall_defaults_to_hybrid(self, MockService, mock_ctx):
+    def test_mcp_recall_leaves_default_search_mode_for_service(self, MockService, mock_ctx):
         from cli_agent_orchestrator.mcp_server.server import memory_recall
 
         mock_ctx.return_value = None
         instance = MockService.return_value
         instance.recall = AsyncMock(return_value=[])
 
-        result = run_async(memory_recall(query="test"))
+        _result = run_async(memory_recall(query="test"))
 
         call_kwargs = instance.recall.call_args.kwargs
-        assert call_kwargs["search_mode"] == "hybrid"
+        assert call_kwargs["search_mode"] is None

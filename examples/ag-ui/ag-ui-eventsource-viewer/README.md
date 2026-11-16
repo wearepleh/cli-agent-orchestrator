@@ -16,14 +16,15 @@ install.
   header; default `http://localhost:9889`). An optional **Access token** field
   attaches `?access_token=` for auth-enabled servers (held in memory only).
 - Listens for the named AG-UI events: `STATE_SNAPSHOT`, `STATE_DELTA`,
-  `GENERATIVE_UI`, `RUN_STARTED`, `RUN_FINISHED`, `STEP_STARTED`,
+  `CUSTOM`, `RUN_STARTED`, `RUN_FINISHED`, `STEP_STARTED`,
   `STEP_FINISHED`, `TOOL_CALL_START`, `TOOL_CALL_END`, `TEXT_MESSAGE_CONTENT`,
   `RUN_ERROR`.
 - Holds a **fleet projection**: hydrates from `STATE_SNAPSHOT` (`data.snapshot`)
   then applies RFC-6902 patches from `STATE_DELTA` (`data.delta`) with a tiny
   inline JSON-Patch applier (`add` / `replace` / `remove`) — no npm dependency.
   The sessions/terminals panel is derived from that projected state.
-- Renders `GENERATIVE_UI` components (`approval_card`, `choice_prompt`,
+- Renders generative-UI components, which arrive as `CUSTOM` events named
+  `cao.generative_ui` with the component in `value` (`approval_card`, `choice_prompt`,
   `diff_summary`, `progress`, `metric`, `agent_card`) from JSON props **only**,
   using DOM APIs (`textContent` / `createElement`) — **no `innerHTML`, no
   `eval`, no `dangerouslySetInnerHTML`**. It keeps a client-side mirror of the
@@ -51,8 +52,10 @@ python3 -m http.server 8000
 You should see the six components appear in the **Generative UI** panel as
 `showcase.sh` emits them, the fleet panel populate from the snapshot, and the
 event log scroll. The off-list `iframe` intent is refused **server-side (HTTP
-400)** by `showcase.sh` and never reaches the stream; if any unknown component
-name ever did arrive, this client would still render it as an inert placeholder.
+400)** by `showcase.sh` and never renders: the stream carries only a
+metadata-only `RAW` refusal record for it, with no props (see `docs/agui.md`).
+If any unknown component name ever did arrive as UI, this client would still
+render it as an inert placeholder.
 
 ### CORS
 
@@ -96,6 +99,11 @@ cd tools
 npm install && npm run playwright:install
 npm run record   # -> docs/media/ag-ui-eventsource-viewer-demo.gif (+ .webm)
 ```
+
+`ffmpeg` is provided by the `ffmpeg-static` npm package (gif-capable), so no
+system ffmpeg install is needed. Override with `FFMPEG_BIN=/path/to/ffmpeg`.
+On Linux or WSL, install Chromium's system libraries once with
+`npx playwright install-deps chromium`.
 
 `tools/` is dev/CI tooling only — the shipped viewer (`index.html`) stays dependency-free.
 

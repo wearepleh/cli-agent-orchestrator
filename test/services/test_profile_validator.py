@@ -75,7 +75,7 @@ class TestValidateFrontmatter:
 
     def test_schema_error_carries_the_field_path(self) -> None:
         """Errors must be locatable, so the UI can point at the offending key."""
-        findings = validate_frontmatter({"name": "agent", "engine": "v3"})
+        findings = validate_frontmatter({"name": "agent", "engine": "v4"})
 
         errors = [f for f in findings if f.severity == "error"]
         assert any(f.path == "engine" for f in errors)
@@ -151,7 +151,7 @@ class TestValidateFrontmatter:
 
     def test_findings_are_validation_message_instances(self) -> None:
         """The service must not leak the CLI's pre-formatted string shape."""
-        findings = validate_frontmatter({"name": "agent", "engine": "v3"})
+        findings = validate_frontmatter({"name": "agent", "engine": "v4"})
 
         assert all(isinstance(f, ValidationMessage) for f in findings)
         assert all(not f.message.startswith("[") for f in findings)
@@ -160,13 +160,45 @@ class TestValidateFrontmatter:
 class TestValidateProfileText:
     """Tests for validate_profile_text."""
 
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            "kimiSwarm: true",
+            "kimiSwarm: false",
+            "kimiSwarm: null",
+            "kimiSwarmMaxConcurrency: 1",
+            "kimiSwarmMaxConcurrency: 10",
+            "kimiSwarmMaxConcurrency: null",
+            "kimiSwarm: true\nkimiSwarmMaxConcurrency: 4",
+        ],
+    )
+    def test_swarm_frontmatter_passes_public_validation(self, fields):
+        text = f"---\nname: bounded-kimi\nprovider: kimi_cli\n{fields}\n---\nReview the input."
+        assert validate_profile_text(text) == []
+
+    @pytest.mark.parametrize(
+        "fields, path",
+        [
+            ('kimiSwarm: "true"', "kimiSwarm"),
+            ("kimiSwarm: 1", "kimiSwarm"),
+            ("kimiSwarmMaxConcurrency: 0", "kimiSwarmMaxConcurrency"),
+            ("kimiSwarmMaxConcurrency: 11", "kimiSwarmMaxConcurrency"),
+            ("kimiSwarmMaxConcurrency: 1.5", "kimiSwarmMaxConcurrency"),
+            ("kimiSwarmMaxConcurrency: true", "kimiSwarmMaxConcurrency"),
+            ('kimiSwarmMaxConcurrency: "4"', "kimiSwarmMaxConcurrency"),
+        ],
+    )
+    def test_invalid_swarm_frontmatter_has_a_field_error(self, fields, path):
+        text = f"---\nname: bounded-kimi\nprovider: kimi_cli\n{fields}\n---\nReview the input."
+        assert any(f.severity == "error" and f.path == path for f in validate_profile_text(text))
+
     def test_parses_frontmatter_and_delegates(self) -> None:
         text = "---\nname: agent\ndescription: d\n---\n\nBody.\n"
 
         assert validate_profile_text(text) == []
 
     def test_surfaces_findings_from_the_parsed_frontmatter(self) -> None:
-        text = "---\nname: agent\nengine: v3\n---\n\nBody.\n"
+        text = "---\nname: agent\nengine: v4\n---\n\nBody.\n"
 
         findings = validate_profile_text(text)
         assert any(f.severity == "error" and f.path == "engine" for f in findings)
@@ -310,12 +342,46 @@ class TestSchemaModelParity:
         )
 
     def test_every_schema_property_is_a_model_field(self) -> None:
-        """The reverse direction: the schema must not advertise dead fields."""
-        extra = set(load_profile_schema()["properties"]) - set(AgentProfile.model_fields)
+        """The reverse direction: the schema must not advertise dead fields.
+
+        ``x-``-prefixed properties are exempt. They are CAO-generated markers
+        stamped into a file's frontmatter by CAO itself, not fields a client
+        authors, so the concern this test exists for -- someone filling in a
+        field that is then silently dropped -- does not apply to them. They must
+        still be *declared*, because the schema is ``additionalProperties:
+        false`` and CAO's own generated files are validated against it; they must
+        NOT be model fields, because they are read straight out of the
+        frontmatter mapping rather than through ``AgentProfile``. The first such
+        marker is ``x-cao-source-stem`` (context-copy install provenance, #493).
+
+        The exemption is deliberately keyed on the ``x-`` prefix rather than an
+        allowlist of names, matching the convention that ``x-`` denotes an
+        extension key, and it is narrow: anything without that prefix is still
+        required to be a real field.
+        """
+        properties = set(load_profile_schema()["properties"])
+        generated_markers = {p for p in properties if p.startswith("x-")}
+        extra = properties - generated_markers - set(AgentProfile.model_fields)
 
         assert not extra, (
             f"The schema declares {sorted(extra)} but AgentProfile has no such "
             "field, so a client filling them in would have them silently dropped."
+        )
+
+    def test_generated_markers_are_not_model_fields(self) -> None:
+        """The exemption above must not become a place to hide real fields.
+
+        An ``x-`` property that IS a model field would mean a client-authorable
+        field escaped the parity check by naming convention alone.
+        """
+        properties = set(load_profile_schema()["properties"])
+        generated_markers = {p for p in properties if p.startswith("x-")}
+        leaked = generated_markers & set(AgentProfile.model_fields)
+
+        assert not leaked, (
+            f"{sorted(leaked)} are declared as x- generated markers but are also "
+            "AgentProfile fields, so they are model fields exempting themselves "
+            "from the schema/model parity check."
         )
 
 

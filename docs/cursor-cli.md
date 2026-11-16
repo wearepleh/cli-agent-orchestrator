@@ -44,30 +44,71 @@ curl -X POST "http://localhost:9889/sessions?provider=cursor_cli&agent_profile=d
 
 The Cursor CLI provider detects terminal states by analyzing output patterns. Cursor CLI v2026.06.15 runs a full Ink/TUI in interactive mode, so the detection targets both the legacy text-mode REPL and the modern TUI:
 
-- **IDLE / COMPLETED (v2026+ TUI)**: Status bar (`Composer …` / `Run Everything`) is visible, and the `ctrl+c to stop` hint is absent from the input-box line. The input box is back to the placeholder (`Plan, search, build anything` on a fresh launch, `Add a follow-up` after the first turn).
-- **PROCESSING (v2026+ TUI)**: Status bar visible AND the `ctrl+c to stop` hint is present on the input-box line. Cursor renders this every frame the agent is working on a turn; it disappears once the response is fully delivered.
+- **IDLE / COMPLETED (v2026+ TUI)**: The TUI has finished rendering, and the `ctrl+c to stop` hint is absent from the input-box line. The input box is back to the placeholder (`Plan, search, build anything` on a fresh launch, `Add a follow-up` after the first turn).
+- **PROCESSING (v2026+ TUI)**: The TUI has finished rendering AND the `ctrl+c to stop` hint is present on the input-box line. Cursor renders this every frame the agent is working on a turn; it disappears once the response is fully delivered.
 - **IDLE / COMPLETED (older text-mode)**: Terminal shows a `❯` (or `>`) REPL prompt on its own line, ready for input.
 - **PROCESSING (older text-mode)**: Spinner characters (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✢✽✻✳·`) with ellipsis on a line immediately before the `──────────────────────` separator.
-- **WAITING_USER_ANSWER**: TUI selection widget (mode picker, model picker) showing the `↑/↓ to navigate` footer, or an active workspace-trust / tool-permission dialog.
+- **WAITING_USER_ANSWER**: TUI selection widget (mode picker, model picker) showing the `↑/↓ to navigate` footer, or an active workspace-trust / tool-permission dialog, including `Workspace Trust Required`.
 - **UNKNOWN**: No recognizable state.
 
-Status detection checks patterns in priority order: PROCESSING → WAITING_USER_ANSWER → COMPLETED → UNKNOWN.
+For modern TUI frames, active selection and trust/permission dialogs are checked
+before PROCESSING or IDLE/COMPLETED. Older text-mode spinner checks run before
+those dialog checks. Unrecognized output is UNKNOWN.
+
+A recognized `Cursor Agent` version banner marks the end of the startup prefix.
+Status detection ignores scrollback before the last such banner, so a resolved
+startup trust dialog does not keep a ready session blocked. A trust or permission
+dialog after that banner still requires user input; detecting it does not accept it.
+
+The newer workspace-trust prompt is recognized by its complete dialog structure:
+the `Workspace Trust Required` title, the directory-trust question and the
+`[a] Trust this workspace` / `[q] Quit` choices. Quoting the title or question in
+an ordinary request or response does not by itself indicate a pending dialog.
+A quoted dialog followed by a newer composer is also treated as transcript
+content rather than a request for approval.
 
 The PROCESSING check is **structural** — for older text-mode builds it walks backwards from the last separator looking for a spinner line, so stale spinner text from a previously completed turn does not trigger a false positive (the same approach used by the Claude Code provider).
 
-For v2026+ TUI detection, the tail of the rolling state buffer (last ~1KB) is consulted. The `ctrl+c to stop` indicator is always rendered in the last few hundred bytes of the input-box line on every Cursor TUI frame, so the 1KB window is well below the buffer cap (`state_buffer_max` server setting, 32KB by default) and the indicator is present whenever the agent is actively working.
+For v2026+ TUI detection, the tail of the rolling state buffer (last ~1KB) is consulted. That window is well below the buffer cap (`state_buffer_max` server setting, 32KB by default). Detection **assumes** Cursor redraws the input box on every TUI frame, so the current input-box line is expected to always be inside that window; this is not independently verified against a live Cursor CLI and is a stated assumption, not a guarantee. If a build ever emits a partial redraw that updates only the status bar or progress line and leaves the input-box line alone, the newest input-box line in the tail is still the previous (working) frame's, and the terminal stays PROCESSING until a frame redraws the input box.
+
+Within that window the `ctrl+c to stop` check is **anchored structurally to the last input-box line**: a line is only treated as an input-box line if it carries Cursor's input arrow (`→`) immediately before the placeholder phrase, not merely the placeholder phrase appearing anywhere in a line — ordinary response prose can contain "Add a follow-up" or "Plan, search, build anything" with no arrow, and matching on phrase alone would let that prose impersonate the input box. The search then covers the tail **from the start of that last structural match to the end of the buffer**, not just that single line, so an indicator that wraps onto the line immediately after the placeholder (e.g. in a narrow pane) is still found. The buffer is an append-only stream of every TUI redraw and a finished Cursor frame is only a few hundred bytes, so a window-wide search would keep seeing the last working frame's indicator after the turn had ended and the terminal would never leave PROCESSING. Builds that render no placeholder have no input-box line to anchor to and fall back to the window-wide search.
+
+"The TUI has finished rendering" means the input-box placeholder is in the tail, **or** the status bar (`Composer …` / `Run Everything`) appears in the buffer. The status bar alone is not sufficient: it renders the active model name, and a Cursor **Free** plan cannot select a named model (`Free plans can only use Auto`), so on those accounts the bar reads `Auto` and matches no known model string. The placeholder is model- and plan-independent, which is why it is the primary signal.
 
 ### Message Extraction
 
-Cursor CLI does not emit a single canonical response marker (unlike Claude Code's `⏺`), so the provider uses the structural **separator + trailing prompt** pattern:
+Cursor CLI does not emit a single canonical response marker (unlike Claude Code's
+`⏺`). The provider first tries the **coloured-panel layout measured on
+2026.10.22**, then the older **separator + trailing prompt** format.
+
+For the coloured-panel layout, extraction retains ANSI colour information until
+the boundaries are identified: the latest submitted request has a distinct
+background from the following idle composer (`→ Add a follow-up` or
+`→ Plan, search, build anything`). Only the response region between them is
+returned. The request echo, composer padding and compact tool-badge rows are
+excluded; response indentation and visible text following tool badges are
+preserved. A `ctrl+c to stop` hint at or below the composer rejects publication
+of a still-running response. An empty response or a missing following composer
+also reports an extraction error.
+
+The panel colours are specific to the measured build/theme. When no submitted
+panel is recognized, extraction tries the existing separator grammar:
 
 1. Find the last `──────────────────────` separator that precedes a trailing `❯` idle prompt.
 2. Find the separator before that one (or the start of the buffer).
 3. Extract the content between them and strip full ECMA-48 escape sequences (CSI, OSC, 2-byte ESC).
 
-If no boundary is detected, extraction raises `ValueError("No Cursor CLI response found - no separator / idle prompt boundary detected")`.
+If neither format supplies a reliable boundary, extraction raises an error.
+An unknown layout or theme is not guessed: `allow_raw_transcript_fallback` is
+`False`, so CAO does not return the entire raw transcript as an answer. This
+also prevents a failed extraction from returning the user's echoed request.
 
-> **Note:** the v2026+ TUI does not emit `─────` separator or `❯` prompt in the pipe-pane buffer (they are TUI widgets), so message extraction on the live TUI stream returns `ValueError`. Use the `get_output` API on a rendered `capture-pane` snapshot (which renders the TUI back into a text-mode stream) when extracting v2026 responses.
+Use the `get_output` API, which extracts from rendered `capture-pane` history
+with ANSI colours preserved. The raw pipe-pane stream contains redraws rather
+than a reliable rendered transcript and is not the extraction input.
+
+Synchronous `cao session send` reports an answer-fetch failure and exits **1**
+instead of silently succeeding. Ctrl-C while waiting still exits **130**.
 
 ### Permission Bypass
 
@@ -76,9 +117,20 @@ By default, CAO launches Cursor CLI with the following flags to skip the interac
 - `--force` — auto-approves every tool call (Bash, file writes, etc.).
 - `--approve-mcps` — pre-approves MCP servers declared via `--plugin-dir`.
 
-`--trust` is **not** passed because Cursor CLI v2026+ rejects it in interactive REPL mode with `Error: --trust can only be used with --print/headless mode`. The CAO launch flow already confirms workspace trust, and the interactive REPL has no per-directory trust dialog for `--trust` to skip.
+`--trust` is **not** passed because Cursor CLI v2026+ rejects it in interactive
+REPL mode with `Error: --trust can only be used with --print/headless mode`.
+Cursor can still display its own `Workspace Trust Required` dialog. CAO reports
+**WAITING_USER_ANSWER** and does not answer that dialog automatically; the
+operator must handle it in the terminal. During startup, it must be resolved
+before the configured `provider_init_timeout` expires: initialization waits for
+IDLE or COMPLETED and fails on timeout rather than waiting indefinitely at the
+trust prompt.
 
-These are safe to set because CAO already confirms workspace trust during `cao launch` ("Do you trust all the actions in this folder?") or via `--yolo`. Without them, every worker agent spawned via handoff/assign would block on a permission dialog with no way to accept it interactively.
+CAO's confirmation during `cao launch` ("Do you trust all the actions in this
+folder?") authorizes the launch and its tool-approval flags. It does not replace
+Cursor's separate workspace-trust decision. The flags above reduce tool/MCP
+approval prompts during handoff/assign; they are not a guarantee that no
+interactive dialog will appear.
 
 ## Configuration
 
@@ -198,8 +250,9 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
 ### Common Issues
 
 1. **Trust Dialog Blocking**
-   - The provider does **not** launch with `--trust` in v2026+ (Cursor rejects the flag in interactive REPL mode). The CAO launch flow's workspace-trust confirmation is sufficient.
-   - If the dialog still appears, verify the `agent` (or `cursor-agent`) version supports `--force` (`agent --help`).
+   - The provider does **not** launch with `--trust` in v2026+ (Cursor rejects the flag in interactive REPL mode). CAO's launch confirmation does not dismiss Cursor's own workspace-trust dialog.
+   - If the full `Workspace Trust Required` dialog appears, the terminal reports **WAITING_USER_ANSWER**. Attach to its tmux session and make the trust decision there; CAO does not automatically accept it. A startup dialog must be resolved within `provider_init_timeout` or initialization fails.
+   - A resolved startup dialog above the latest recognized `Cursor Agent` version banner is ignored by status detection; a current dialog after it still blocks.
 
 2. **MCP Approval Dialog Blocking**
    - The provider launches with `--approve-mcps` when the profile declares `mcpServers`, and the MCP servers are written into a `--plugin-dir` manifest.
@@ -214,7 +267,7 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
 4. **Status Stuck on UNKNOWN**
    - Attach to the tmux session (`tmux attach -t <session-name>`) and check terminal output.
    - Verify Cursor CLI starts correctly in a regular terminal first: `agent --print "hello"`.
-   - For v2026+ the detector expects the TUI to be rendered (you should see the `→ Add a follow-up` placeholder and a status bar with `Composer 2.5 Fast`). Older text-mode builds classify via `❯` prompt + `─────` separator.
+   - For v2026+ the detector expects the TUI to be rendered (you should see the `→ Add a follow-up` placeholder, or a status bar with `Composer 2.5 Fast` / `Run Everything`). Older text-mode builds classify via `❯` prompt + `─────` separator.
 
 5. **`agent` Not Found on `$PATH`**
    - The provider does not prefix the command with an absolute path — install the binary where your shell can find it.
